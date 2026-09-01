@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>SMC Bot Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+<div class="app">
+
+  <div id="errorBanner" class="error-banner hidden"></div>
+
+  <div class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span class="brand-name">SMC BOT</span>
+      <span class="brand-meta">BTC/USD &middot; 5m &middot; KRAKEN</span>
+    </div>
+    <div class="tabs">
+      <button class="tab active" data-mode="backtest">BACKTEST</button>
+      <button class="tab" data-mode="paper">PAPER</button>
+      <button class="tab" data-mode="live">LIVE</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="status-strip">
+      <div class="status-item"><span class="status-label">BACKTEST</span><span id="statusBacktest" class="status-value">idle</span></div>
+      <div class="status-sep"></div>
+      <div class="status-item"><span class="status-label">PAPER</span><span id="dotPaper" class="status-dot"></span><span id="statusPaper" class="status-value amber">not wired</span></div>
+      <div class="status-sep"></div>
+      <div class="status-item"><span class="status-label">LIVE</span><span id="dotLive" class="status-dot"></span><span id="statusLive" class="status-value red">disabled</span></div>
+    </div>
+  </div>
+
+  <!-- BACKTEST PANEL -->
+  <div id="panelBacktest" class="mode-panel">
+    <div class="param-row">
+      <div class="param-group">
+        <span class="param-label">SNAPSHOT</span>
+        <select id="snapshotSelect"></select>
+      </div>
+      <div class="param-group">
+        <span class="param-label">CONFLUENCE THRESHOLD</span>
+        <div class="param-inline"><input id="paramConfluence" type="number" value="2" min="1" max="4" style="width:48px; text-align:center" /><span class="param-suffix">of 4 detectors</span></div>
+      </div>
+      <div class="param-group">
+        <span class="param-label">INITIAL BALANCE</span>
+        <div class="param-inline"><span class="param-suffix">$</span><input id="paramBalance" type="number" value="20000" style="width:90px" /></div>
+      </div>
+      <div class="param-group">
+        <span class="param-label">TAKER FEE</span>
+        <div class="param-inline"><input id="paramFee" type="number" value="0.40" step="0.01" style="width:62px; text-align:right" /><span class="param-suffix">%</span></div>
+      </div>
+      <div class="param-group border-r">
+        <span class="param-label">SLIPPAGE</span>
+        <div class="param-inline"><input id="paramSlippage" type="number" value="5" style="width:52px; text-align:right" /><span class="param-suffix">bps</span></div>
+      </div>
+      <button id="runBacktestBtn" class="btn btn-primary">RUN BACKTEST</button>
+      <div class="spacer"></div>
+      <div class="param-note">min_confluence has no validated default yet - see signals/smc_aggregator.py</div>
+    </div>
+    <div id="progressBox" class="progress-box hidden">
+      <div class="progress-head">
+        <span class="progress-title">RUNNING BACKTEST</span>
+        <span id="progressPct" class="progress-pct">0%</span>
+        <div class="spacer"></div>
+        <span id="progressCandles" class="progress-meta">0 / 0 candles</span>
+      </div>
+      <div class="progress-track"><div id="progressBar" class="progress-fill"></div></div>
+    </div>
+  </div>
+
+  <!-- PAPER PANEL -->
+  <div id="panelPaper" class="mode-panel hidden">
+    <div class="paper-row">
+      <button id="paperToggleBtn" class="btn btn-primary">START PAPER TRADING</button>
+      <div class="v-sep"></div>
+      <div class="stat"><span class="param-label">VIRTUAL BALANCE</span><span id="paperBalance" class="stat-value amber">$--</span></div>
+      <div class="v-sep"></div>
+      <div class="stat"><span class="param-label">OPEN POSITION</span><span id="paperPosition" class="stat-value">flat</span></div>
+      <div class="spacer"></div>
+      <div class="conn-indicator"><span id="connDot" class="status-dot"></span><span id="connLabel" class="conn-label">not connected</span></div>
+    </div>
+    <div class="notice">Paper trading isn't wired to Kraken's live WS feed yet (next session's scope) - starting it will report that plainly instead of pretending to run.</div>
+  </div>
+
+  <!-- LIVE PANEL -->
+  <div id="panelLive" class="mode-panel hidden">
+    <div class="live-row">
+      <div class="kill-box">
+        <div class="kill-head"><span id="killDot" class="status-dot red"></span><span class="param-label">KILL SWITCH</span><span id="killState" class="stat-value red">NOT READY</span></div>
+        <div id="killReason" class="kill-reason">Kill switch not implemented yet.</div>
+      </div>
+      <div class="v-sep"></div>
+      <div class="stat"><span class="param-label">START LIVE TRADING</span>
+        <button id="liveStartBtn" class="btn btn-danger" disabled>START LIVE</button>
+      </div>
+    </div>
+    <div class="notice">The Start control above is a genuinely disabled HTML element (not just styled to look disabled) until live/trader.kill_switch_ready() returns True.</div>
+  </div>
+
+  <!-- CHART + FEED -->
+  <div class="chart-row">
+    <div class="chart-col">
+      <div class="chart-toolbar">
+        <span class="param-label">OVERLAYS</span>
+        <div class="overlay-toggles">
+          <button class="overlay-btn active" data-layer="orderBlocks"><span class="swatch ob"></span>ORDER BLOCKS</button>
+          <button class="overlay-btn active" data-layer="fvgs"><span class="swatch fvg"></span>FVG</button>
+          <button class="overlay-btn active" data-layer="swings"><span class="swatch swing"></span>SWINGS</button>
+          <button class="overlay-btn active" data-layer="structure"><span class="swatch structure"></span>BOS/CHoCH</button>
+        </div>
+        <div class="spacer"></div>
+        <span id="lastPrice" class="last-price">--</span>
+      </div>
+      <div class="chart-wrap">
+        <div id="chart"></div>
+        <canvas id="overlayCanvas"></canvas>
+      </div>
+    </div>
+    <div class="feed-col">
+      <div class="feed-head"><span class="param-label">TRADE LOG</span><span id="feedMeta" class="progress-meta">0 trades</span></div>
+      <div id="feedList" class="feed-list">
+        <div class="feed-empty">No trades yet - run a backtest.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESULTS -->
+  <div id="resultsRow" class="results-row hidden">
+    <div class="metrics-col">
+      <div class="section-title">RESULTS</div>
+      <div id="metricsList"></div>
+    </div>
+    <div class="equity-col">
+      <div class="chart-toolbar">
+        <span class="param-label">EQUITY CURVE</span>
+        <div class="legend"><span class="legend-swatch strategy"></span>SMC strategy</div>
+        <div class="legend"><span class="legend-swatch bh"></span>buy &amp; hold</div>
+      </div>
+      <div class="equity-svg-wrap">
+        <svg id="equitySvg" viewBox="0 0 600 200" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
