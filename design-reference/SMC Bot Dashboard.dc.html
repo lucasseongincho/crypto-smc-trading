@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#101216; }
+  body { font-family:'IBM Plex Sans', system-ui, sans-serif; -webkit-font-smoothing:antialiased; }
+  a { color:#38bdf8; text-decoration:none; }
+  a:hover { color:#7dd3fc; }
+  * { box-sizing:border-box; }
+  input, button, select { font-family:inherit; }
+  input:focus, select:focus, button:focus-visible { outline:1px solid #38bdf8; outline-offset:0; }
+  ::-webkit-scrollbar { width:9px; height:9px; }
+  ::-webkit-scrollbar-thumb { background:#2c3138; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  @keyframes smcpulse { 0%,100% { opacity:1 } 50% { opacity:.25 } }
+</style>
+</helmet>
+<div style="min-width:1280px; background:#101216; color:#d8dce2; font-size:13px; min-height:100vh; display:flex; flex-direction:column">
+
+  <div style="display:flex; align-items:stretch; height:44px; borderBottom:1px solid #23272e; background:#15181d; flex:none">
+    <div style="display:flex; align-items:center; gap:10px; padding:0 16px; border-right:1px solid #23272e">
+      <div style="width:7px; height:7px; background:#38bdf8; border-radius:50%"></div>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; font-weight:600; letter-spacing:.08em; color:#d8dce2">SMC BOT</span>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#79828c; letter-spacing:.04em">BTC/USDT · 5m · BINANCE</span>
+    </div>
+    <div style="display:flex; align-items:stretch">
+      <button onClick="{{ goBacktest }}" style="background:{{ tabBgBacktest }}; color:{{ tabFgBacktest }}; border:0; border-right:1px solid #23272e; border-bottom:2px solid {{ tabLineBacktest }}; padding:0 20px; font-size:12px; font-weight:500; letter-spacing:.06em; cursor:pointer">BACKTEST</button>
+      <button onClick="{{ goPaper }}" style="background:{{ tabBgPaper }}; color:{{ tabFgPaper }}; border:0; border-right:1px solid #23272e; border-bottom:2px solid {{ tabLinePaper }}; padding:0 20px; font-size:12px; font-weight:500; letter-spacing:.06em; cursor:pointer">PAPER</button>
+      <button onClick="{{ goLive }}" style="background:{{ tabBgLive }}; color:{{ tabFgLive }}; border:0; border-right:1px solid #23272e; border-bottom:2px solid {{ tabLineLive }}; padding:0 20px; font-size:12px; font-weight:500; letter-spacing:.06em; cursor:pointer">LIVE</button>
+    </div>
+    <div style="flex:1"></div>
+    <div style="display:flex; align-items:center; gap:22px; padding:0 18px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; letter-spacing:.03em">
+      <div style="display:flex; align-items:center; gap:7px">
+        <span style="color:#565d66">BACKTEST</span>
+        <span style="color:#8b949e">{{ statusBacktest }}</span>
+      </div>
+      <div style="width:1px; height:16px; background:#23272e"></div>
+      <div style="display:flex; align-items:center; gap:7px">
+        <span style="color:#565d66">PAPER</span>
+        <span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:{{ dotPaper }}; animation:{{ dotPaperAnim }}"></span>
+        <span style="color:#d99a2b">{{ statusPaper }}</span>
+      </div>
+      <div style="width:1px; height:16px; background:#23272e"></div>
+      <div style="display:flex; align-items:center; gap:7px">
+        <span style="color:#565d66">LIVE</span>
+        <span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:{{ dotLive }}"></span>
+        <span style="color:{{ statusLiveColor }}">{{ statusLive }}</span>
+      </div>
+    </div>
+  </div>
+
+  <sc-if value="{{ isBacktest }}" hint-placeholder-val="{{ true }}">
+    <div style="border-bottom:1px solid #23272e; background:#13161a">
+      <div style="display:flex; align-items:flex-end; gap:0; padding:14px 16px">
+        <div style="display:flex; flex-direction:column; gap:6px; padding-right:18px; border-right:1px solid #23272e; margin-right:18px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">DATE RANGE</span>
+          <div style="display:flex; align-items:center; gap:8px">
+            <input value="{{ paramFrom }}" onChange="{{ setFrom }}" style="background:#0c0e11; border:1px solid #2c3138; color:#d8dce2; font-family:'IBM Plex Mono',monospace; font-size:12.5px; padding:6px 9px; width:112px" />
+            <span style="color:#565d66">→</span>
+            <input value="{{ paramTo }}" onChange="{{ setTo }}" style="background:#0c0e11; border:1px solid #2c3138; color:#d8dce2; font-family:'IBM Plex Mono',monospace; font-size:12.5px; padding:6px 9px; width:112px" />
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-right:18px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">CONFLUENCE THRESHOLD</span>
+          <div style="display:flex; align-items:center; gap:8px">
+            <input value="{{ paramThreshold }}" onChange="{{ setThreshold }}" style="background:#0c0e11; border:1px solid #2c3138; color:#d8dce2; font-family:'IBM Plex Mono',monospace; font-size:12.5px; padding:6px 9px; width:48px; text-align:center" />
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#79828c">of 5 detectors</span>
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; margin-right:18px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">TAKER FEE</span>
+          <div style="display:flex; align-items:center; gap:6px">
+            <input value="{{ paramFee }}" onChange="{{ setFee }}" style="background:#0c0e11; border:1px solid #2c3138; color:#d8dce2; font-family:'IBM Plex Mono',monospace; font-size:12.5px; padding:6px 9px; width:62px; text-align:right" />
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#79828c">%</span>
+          </div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:6px; padding-right:18px; border-right:1px solid #23272e; margin-right:18px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">SLIPPAGE</span>
+          <div style="display:flex; align-items:center; gap:6px">
+            <input value="{{ paramSlippage }}" onChange="{{ setSlippage }}" style="background:#0c0e11; border:1px solid #2c3138; color:#d8dce2; font-family:'IBM Plex Mono',monospace; font-size:12.5px; padding:6px 9px; width:52px; text-align:right" />
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#79828c">bps</span>
+          </div>
+        </div>
+        <button onClick="{{ runBacktest }}" disabled="{{ running }}" style="background:{{ runBtnBg }}; color:{{ runBtnFg }}; border:1px solid {{ runBtnBorder }}; padding:8px 22px; font-size:12.5px; font-weight:600; letter-spacing:.06em; cursor:{{ runBtnCursor }}">{{ runBtnLabel }}</button>
+        <div style="flex:1"></div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66; text-align:right; line-height:1.6">
+          <div>threshold is a placeholder — not yet validated against data</div>
+          <div>{{ paramSummary }}</div>
+        </div>
+      </div>
+
+      <sc-if value="{{ running }}" hint-placeholder-val="{{ false }}">
+        <div style="padding:0 16px 16px">
+          <div style="border:1px solid #2c3138; background:#0c0e11; padding:13px 15px; display:flex; flex-direction:column; gap:10px">
+            <div style="display:flex; align-items:baseline; gap:14px; font-family:'IBM Plex Mono',monospace; font-size:12px">
+              <span style="color:#d8dce2; font-weight:600">RUNNING BACKTEST</span>
+              <span style="color:#38bdf8; font-size:15px; font-weight:600">{{ progressPct }}%</span>
+              <div style="flex:1"></div>
+              <span style="color:#79828c">{{ candlesProcessed }} / {{ candlesTotal }} candles</span>
+              <span style="color:#565d66">|</span>
+              <span style="color:#79828c">elapsed {{ elapsed }}</span>
+              <span style="color:#565d66">|</span>
+              <span style="color:#79828c">~{{ remaining }} remaining</span>
+            </div>
+            <div style="height:4px; background:#23272e; overflow:hidden">
+              <div style="height:100%; width:{{ progressWidth }}; background:#38bdf8"></div>
+            </div>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isPaper }}" hint-placeholder-val="{{ false }}">
+    <div>
+      <sc-if value="{{ connDegraded }}" hint-placeholder-val="{{ false }}">
+        <div style="background:#2a1d0c; border-bottom:1px solid #6b4a12; padding:11px 16px; display:flex; align-items:center; gap:12px">
+          <span style="display:inline-block; width:7px; height:7px; border-radius:50%; background:#d99a2b; animation:smcpulse 1s infinite"></span>
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:12.5px; color:#e8b84f; font-weight:600; letter-spacing:.04em">{{ connBannerTitle }}</span>
+          <span style="font-size:12.5px; color:#c9a35e">{{ connBannerBody }}</span>
+        </div>
+      </sc-if>
+      <div style="display:flex; align-items:center; gap:0; padding:14px 16px; border-bottom:1px solid #23272e; background:#13161a">
+        <button onClick="{{ togglePaper }}" style="background:{{ paperBtnBg }}; color:{{ paperBtnFg }}; border:1px solid {{ paperBtnBorder }}; padding:9px 24px; font-size:12.5px; font-weight:600; letter-spacing:.06em; cursor:pointer">{{ paperBtnLabel }}</button>
+        <div style="width:1px; height:34px; background:#23272e; margin:0 20px"></div>
+        <div style="display:flex; flex-direction:column; gap:4px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">VIRTUAL BALANCE</span>
+          <div style="display:flex; align-items:baseline; gap:10px">
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:26px; font-weight:600; color:#d99a2b; letter-spacing:-.01em">{{ paperBalance }}</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:10px; font-weight:600; letter-spacing:.14em; color:#2a1d0c; background:#d99a2b; padding:3px 7px">VIRTUAL</span>
+          </div>
+        </div>
+        <div style="width:1px; height:34px; background:#23272e; margin:0 20px"></div>
+        <div style="display:flex; flex-direction:column; gap:4px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">SESSION P&amp;L</span>
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; color:{{ paperPnlColor }}">{{ paperPnl }}</span>
+        </div>
+        <div style="width:1px; height:34px; background:#23272e; margin:0 20px"></div>
+        <div style="display:flex; flex-direction:column; gap:4px">
+          <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">OPEN POSITION</span>
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; color:#d8dce2">{{ paperPosition }}</span>
+        </div>
+        <div style="flex:1"></div>
+        <div style="display:flex; align-items:center; gap:8px; font-family:'IBM Plex Mono',monospace; font-size:11.5px">
+          <span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:{{ connDotColor }}"></span>
+          <span style="color:{{ connTextColor }}">{{ connLabel }}</span>
+          <span style="color:#565d66">·</span>
+          <span style="color:#565d66">last msg {{ connLastMsg }}</span>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <sc-if value="{{ isLive }}" hint-placeholder-val="{{ false }}">
+    <div style="border-bottom:1px solid #23272e; background:#13161a">
+      <div style="display:flex; align-items:stretch; border-bottom:1px solid #23272e">
+        <div style="flex:0 0 420px; border-right:1px solid #23272e; padding:14px 16px; background:{{ killBg }}">
+          <div style="display:flex; align-items:center; gap:9px; margin-bottom:9px">
+            <span style="display:inline-block; width:8px; height:8px; border-radius:50%; background:{{ killDot }}"></span>
+            <span style="font-size:10.5px; letter-spacing:.12em; color:#79828c">KILL SWITCH</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:600; letter-spacing:.06em; color:{{ killColor }}">{{ killState }}</span>
+          </div>
+          <div style="font-size:12.5px; color:#a9b1ba; line-height:1.55; margin-bottom:11px">{{ killReason }}</div>
+          <div style="display:flex; align-items:center; gap:10px">
+            <button onClick="{{ recheck }}" style="background:transparent; color:#38bdf8; border:1px solid #2c5c73; padding:6px 13px; font-size:11.5px; font-weight:500; letter-spacing:.05em; cursor:pointer">RE-RUN PREFLIGHT</button>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66">checked {{ killChecked }}</span>
+          </div>
+        </div>
+
+        <div style="flex:1; padding:14px 16px; display:flex; align-items:center; gap:0">
+          <div style="display:flex; flex-direction:column; gap:8px">
+            <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">START LIVE TRADING</span>
+            <div style="display:flex; align-items:center; gap:10px">
+              <button onClick="{{ liveAction }}" disabled="{{ liveBtnDisabled }}" style="background:{{ liveBtnBg }}; color:{{ liveBtnFg }}; border:1px solid {{ liveBtnBorder }}; padding:9px 24px; font-size:12.5px; font-weight:600; letter-spacing:.06em; cursor:{{ liveBtnCursor }}">{{ liveBtnLabel }}</button>
+              <sc-if value="{{ liveArmed }}" hint-placeholder-val="{{ false }}">
+                <button onClick="{{ disarm }}" style="background:transparent; color:#79828c; border:1px solid #2c3138; padding:9px 15px; font-size:12px; letter-spacing:.05em; cursor:pointer">CANCEL</button>
+              </sc-if>
+              <span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:{{ liveHintColor }}">{{ liveHint }}</span>
+            </div>
+          </div>
+          <div style="width:1px; height:44px; background:#23272e; margin:0 24px"></div>
+          <div style="display:flex; flex-direction:column; gap:4px">
+            <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">ACCOUNT BALANCE · REAL</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:26px; font-weight:600; color:#e8eaed; letter-spacing:-.01em">{{ liveBalance }}</span>
+          </div>
+          <div style="width:1px; height:44px; background:#23272e; margin:0 24px"></div>
+          <div style="display:flex; flex-direction:column; gap:4px">
+            <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">TODAY P&amp;L</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; color:{{ livePnlColor }}">{{ livePnl }}</span>
+          </div>
+          <div style="flex:1"></div>
+          <div style="display:flex; flex-direction:column; gap:4px; text-align:right">
+            <span style="font-size:10.5px; letter-spacing:.1em; color:#565d66">OPEN POSITION</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; color:#d8dce2">{{ livePosition }}</span>
+          </div>
+        </div>
+      </div>
+
+      <sc-if value="{{ liveArmed }}" hint-placeholder-val="{{ false }}">
+        <div style="padding:14px 16px; background:#1d1113; border-bottom:1px solid #5c2621">
+          <div style="display:flex; align-items:center; gap:9px; margin-bottom:12px">
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; font-weight:600; letter-spacing:.08em; color:#e0483d">ARMED — CONFIRM RISK SETTINGS BEFORE STARTING</span>
+            <span style="font-size:12.5px; color:#a9938f">These are the limits the bot will trade under. Starting moves real money.</span>
+          </div>
+          <div style="display:flex; gap:0; border:1px solid #5c2621">
+            <sc-for list="{{ riskSummary }}" as="r" hint-placeholder-count="5">
+              <div style="flex:1; padding:11px 14px; border-right:1px solid #5c2621; display:flex; flex-direction:column; gap:5px">
+                <span style="font-size:10.5px; letter-spacing:.09em; color:#9a7a76">{{ r.label }}</span>
+                <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; color:#f0dcd9">{{ r.value }}</span>
+              </div>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+  </sc-if>
+
+  <div style="display:flex; align-items:stretch; border-bottom:1px solid #23272e">
+    <div style="flex:1; min-width:0; display:flex; flex-direction:column; border-right:1px solid #23272e">
+      <div style="display:flex; align-items:center; gap:14px; padding:9px 14px; border-bottom:1px solid #23272e; background:#13161a">
+        <span style="font-size:10.5px; letter-spacing:.11em; color:#565d66">OVERLAYS</span>
+        <div style="display:flex; gap:7px">
+          <sc-for list="{{ overlayToggles }}" as="o" hint-placeholder-count="4">
+            <button onClick="{{ o.onToggle }}" style="background:{{ o.bg }}; color:{{ o.fg }}; border:1px solid {{ o.border }}; padding:4px 10px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:.04em; cursor:pointer; display:flex; align-items:center; gap:6px">
+              <span style="display:inline-block; width:7px; height:7px; background:{{ o.swatch }}"></span>
+              <span>{{ o.label }}</span>
+            </button>
+          </sc-for>
+        </div>
+        <div style="flex:1"></div>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#79828c">{{ chartCaption }}</span>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:13px; font-weight:600; color:#e8eaed">{{ lastPrice }}</span>
+      </div>
+
+      <div style="position:relative; background:#101216">
+        <div ref="{{ chartRef }}" style="width:100%; height:{{ chartHeight }}"></div>
+        <canvas ref="{{ overlayRef }}" style="position:absolute; inset:0; width:100%; height:100%; pointer-events:none"></canvas>
+      </div>
+
+      <sc-if value="{{ isBacktest }}" hint-placeholder-val="{{ true }}">
+        <div style="display:flex; align-items:center; gap:14px; padding:10px 14px; border-top:1px solid #23272e; background:#13161a">
+          <span style="font-size:10.5px; letter-spacing:.11em; color:#565d66">REPLAY</span>
+          <div style="display:flex; gap:6px">
+            <button onClick="{{ prevSignal }}" style="background:#1a1e24; color:#a9b1ba; border:1px solid #2c3138; padding:5px 11px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; cursor:pointer">◀ SIG</button>
+            <button onClick="{{ togglePlay }}" style="background:#1a1e24; color:#38bdf8; border:1px solid #2c5c73; padding:5px 14px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; cursor:pointer">{{ playLabel }}</button>
+            <button onClick="{{ nextSignal }}" style="background:#1a1e24; color:#a9b1ba; border:1px solid #2c3138; padding:5px 11px; font-family:'IBM Plex Mono',monospace; font-size:11.5px; cursor:pointer">SIG ▶</button>
+          </div>
+          <input type="range" min="20" max="{{ candlesTotal }}" value="{{ replayIdx }}" onChange="{{ setReplay }}" style="flex:1; accentColor:#38bdf8; background:transparent" />
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#79828c; width:170px; text-align:right">{{ replayLabel }}</span>
+          <div style="display:flex; gap:4px">
+            <sc-for list="{{ speeds }}" as="sp" hint-placeholder-count="3">
+              <button onClick="{{ sp.onPick }}" style="background:{{ sp.bg }}; color:{{ sp.fg }}; border:1px solid {{ sp.border }}; padding:4px 8px; font-family:'IBM Plex Mono',monospace; font-size:11px; cursor:pointer">{{ sp.label }}</button>
+            </sc-for>
+          </div>
+        </div>
+      </sc-if>
+    </div>
+
+    <div style="flex:0 0 340px; display:flex; flex-direction:column; background:#13161a">
+      <div style="display:flex; align-items:center; padding:9px 14px; border-bottom:1px solid #23272e">
+        <span style="font-size:10.5px; letter-spacing:.11em; color:#565d66">SIGNAL FEED</span>
+        <div style="flex:1"></div>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66">{{ feedMeta }}</span>
+      </div>
+      <div style="flex:1; overflow-y:auto; max-height:{{ feedHeight }}">
+        <sc-for list="{{ signals }}" as="s" hint-placeholder-count="7">
+          <div style="border-bottom:1px solid #1c2026; background:{{ s.rowBg }}">
+            <div onClick="{{ s.onToggle }}" style="display:flex; align-items:center; gap:10px; padding:9px 14px; cursor:pointer">
+              <span style="width:3px; height:26px; background:{{ s.dirColor }}; flex:none"></span>
+              <div style="display:flex; flex-direction:column; gap:3px; min-width:0; flex:1">
+                <div style="display:flex; align-items:baseline; gap:8px">
+                  <span style="font-family:'IBM Plex Mono',monospace; font-size:12.5px; font-weight:600; color:{{ s.dirColor }}">{{ s.dir }}</span>
+                  <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#a9b1ba">{{ s.price }}</span>
+                  <sc-if value="{{ s.becameTrade }}" hint-placeholder-val="{{ false }}">
+                    <span style="font-family:'IBM Plex Mono',monospace; font-size:9.5px; letter-spacing:.1em; color:#0c0e11; background:#79828c; padding:2px 5px">FILLED</span>
+                  </sc-if>
+                </div>
+                <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66">{{ s.timeLabel }} · {{ s.trigger }}</span>
+              </div>
+              <div style="display:flex; flex-direction:column; align-items:flex-end; gap:2px">
+                <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; color:{{ s.scoreColor }}">{{ s.score }}</span>
+                <span style="font-family:'IBM Plex Mono',monospace; font-size:9.5px; letter-spacing:.06em; color:#565d66">OF 5</span>
+              </div>
+              <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66; width:10px">{{ s.caret }}</span>
+            </div>
+            <sc-if value="{{ s.expanded }}" hint-placeholder-val="{{ false }}">
+              <div style="padding:2px 14px 12px 27px; display:flex; flex-direction:column; gap:9px">
+                <div style="display:flex; flex-wrap:wrap; gap:5px">
+                  <sc-for list="{{ s.detectors }}" as="d" hint-placeholder-count="5">
+                    <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:{{ d.color }}; border:1px solid {{ d.border }}; padding:3px 8px; letter-spacing:.03em">{{ d.name }} {{ d.value }}</span>
+                  </sc-for>
+                </div>
+                <div style="display:flex; gap:14px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66">
+                  <span>{{ s.detail }}</span>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+        </sc-for>
+        <sc-if value="{{ feedEmpty }}" hint-placeholder-val="{{ false }}">
+          <div style="padding:40px 20px; text-align:center; font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#4a5158; line-height:1.7">{{ feedEmptyText }}</div>
+        </sc-if>
+      </div>
+    </div>
+  </div>
+
+  <sc-if value="{{ showResults }}" hint-placeholder-val="{{ true }}">
+    <div style="display:flex; align-items:stretch; border-bottom:1px solid #23272e; background:#13161a">
+      <div style="flex:0 0 460px; border-right:1px solid #23272e">
+        <div style="padding:9px 14px; border-bottom:1px solid #23272e; font-size:10.5px; letter-spacing:.11em; color:#565d66">RESULTS</div>
+        <sc-for list="{{ metrics }}" as="m" hint-placeholder-count="6">
+          <div style="display:flex; align-items:baseline; padding:9px 14px; border-bottom:1px solid #1c2026">
+            <span style="flex:1; font-size:12.5px; color:#a9b1ba">{{ m.label }}</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66; width:110px; text-align:right">{{ m.baseline }}</span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:15px; font-weight:600; color:{{ m.color }}; width:110px; text-align:right">{{ m.value }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div style="flex:1; min-width:0; display:flex; flex-direction:column">
+        <div style="display:flex; align-items:center; gap:16px; padding:9px 14px; border-bottom:1px solid #23272e">
+          <span style="font-size:10.5px; letter-spacing:.11em; color:#565d66">EQUITY CURVE</span>
+          <div style="display:flex; align-items:center; gap:6px">
+            <span style="width:14px; height:2px; background:#38bdf8; display:inline-block"></span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#79828c">SMC strategy</span>
+          </div>
+          <div style="display:flex; align-items:center; gap:6px">
+            <span style="width:14px; height:2px; background:#565d66; display:inline-block"></span>
+            <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#79828c">buy &amp; hold</span>
+          </div>
+          <div style="flex:1"></div>
+          <button onClick="{{ exportCsv }}" style="background:transparent; color:#79828c; border:1px solid #2c3138; padding:4px 10px; font-family:'IBM Plex Mono',monospace; font-size:11px; cursor:pointer">EXPORT CSV</button>
+        </div>
+        <div style="flex:1; padding:14px 16px; min-height:220px">
+          <svg viewBox="0 0 600 200" preserveAspectRatio="none" style="width:100%; height:200px; display:block">
+            <line x1="0" y1="199" x2="600" y2="199" stroke="#23272e" stroke-width="1"></line>
+            <line x1="0" y1="150" x2="600" y2="150" stroke="#1c2026" stroke-width="1"></line>
+            <line x1="0" y1="100" x2="600" y2="100" stroke="#1c2026" stroke-width="1"></line>
+            <line x1="0" y1="50" x2="600" y2="50" stroke="#1c2026" stroke-width="1"></line>
+            <polyline points="{{ bnhPoints }}" fill="none" stroke="#565d66" stroke-width="1.5" stroke-dasharray="4 3"></polyline>
+            <polyline points="{{ eqPoints }}" fill="none" stroke="#38bdf8" stroke-width="1.75"></polyline>
+          </svg>
+          <div style="display:flex; justify-content:space-between; font-family:'IBM Plex Mono',monospace; font-size:10.5px; color:#4a5158; padding-top:6px">
+            <span>{{ paramFrom }}</span>
+            <span>{{ paramTo }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <div style="flex:1; background:#13161a">
+    <div style="display:flex; align-items:center; padding:9px 14px; border-bottom:1px solid #23272e">
+      <span style="font-size:10.5px; letter-spacing:.11em; color:#565d66">{{ logTitle }}</span>
+      <div style="flex:1"></div>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#565d66">{{ logMeta }}</span>
+    </div>
+    <div style="display:flex; padding:7px 14px; border-bottom:1px solid #23272e; font-size:10.5px; letter-spacing:.08em; color:#565d66">
+      <span style="width:96px">TIME</span>
+      <span style="width:62px">SIDE</span>
+      <span style="width:150px">ENTRY → EXIT</span>
+      <span style="width:96px; text-align:right">SIZE</span>
+      <span style="width:130px; text-align:right">P&amp;L</span>
+      <span style="width:66px; text-align:right">R</span>
+      <span style="width:66px; text-align:right">CONF</span>
+      <span style="flex:1; text-align:right">EXIT REASON</span>
+    </div>
+    <sc-for list="{{ trades }}" as="t" hint-placeholder-count="6">
+      <div style="display:flex; align-items:center; padding:8px 14px; border-bottom:1px solid #1c2026; background:{{ t.rowBg }}; font-family:'IBM Plex Mono',monospace; font-size:12px">
+        <span style="width:96px; color:#79828c">{{ t.time }}</span>
+        <span style="width:62px; color:{{ t.sideColor }}; font-weight:600">{{ t.side }}</span>
+        <span style="width:150px; color:#a9b1ba">{{ t.prices }}</span>
+        <span style="width:96px; text-align:right; color:#a9b1ba">{{ t.size }}</span>
+        <span style="width:130px; text-align:right; color:{{ t.pnlColor }}; font-weight:600">{{ t.pnl }}</span>
+        <span style="width:66px; text-align:right; color:{{ t.pnlColor }}">{{ t.r }}</span>
+        <span style="width:66px; text-align:right; color:#79828c">{{ t.conf }}</span>
+        <span style="flex:1; text-align:right; color:#79828c">{{ t.reason }}</span>
+      </div>
+    </sc-for>
+    <sc-if value="{{ logEmpty }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:34px 20px; text-align:center; font-family:'IBM Plex Mono',monospace; font-size:11.5px; color:#4a5158">{{ logEmptyText }}</div>
+    </sc-if>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;initialMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;backtest&quot;,&quot;paper&quot;,&quot;live&quot;],&quot;default&quot;:&quot;backtest&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;State&quot;},&quot;killSwitchReady&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;State&quot;},&quot;paperConnection&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;healthy&quot;,&quot;reconnecting&quot;,&quot;dropped&quot;],&quot;default&quot;:&quot;healthy&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;State&quot;},&quot;chartHeight&quot;:{&quot;editor&quot;:&quot;int&quot;,&quot;default&quot;:440,&quot;min&quot;:320,&quot;max&quot;:700,&quot;unit&quot;:&quot;px&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Layout&quot;}}">
+const RULE = '#23272e';
+const OVERLAY_DEFS = [
+  { key: 'ob', label: 'ORDER BLOCK', color: '#a78bfa' },
+  { key: 'fvg', label: 'FVG', color: '#38bdf8' },
+  { key: 'sweep', label: 'LIQ SWEEP', color: '#e07b53' },
+  { key: 'bos', label: 'BOS / CHoCH', color: '#4ade80' }
+];
+const DET_NAMES = ['ORDER BLOCK', 'FVG', 'SWING', 'BOS/CHoCH', 'FAKEOUT'];
+
+function rng(seed) {
+  let s = seed;
+  return function () { s = (s * 1664525 + 1013904223) % 4294967296; return s / 4294967296; };
+}
+
+function buildCandles(n) {
+  const r = rng(20240513);
+  const start = Math.floor(Date.UTC(2026, 5, 28, 0, 0, 0) / 1000);
+  let price = 63200;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const drift = Math.sin(i / 26) * 34 + Math.sin(i / 7.3) * 12;
+    const shock = (r() - 0.5) * 130;
+    const open = price;
+    const close = open + drift * 0.28 + shock;
+    const high = Math.max(open, close) + r() * 60;
+    const low = Math.min(open, close) - r() * 60;
+    out.push({ time: start + i * 300, open: +open.toFixed(1), high: +high.toFixed(1), low: +low.toFixed(1), close: +close.toFixed(1) });
+    price = close;
+  }
+  return out;
+}
+
+function fmtUSD(v, dp) {
+  const d = dp === undefined ? 2 : dp;
+  const neg = v < 0;
+  const s = Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+  return (neg ? '-$' : '$') + s;
+}
+function fmtSigned(v) {
+  const s = Math.abs(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (v < 0 ? '−$' : '+$') + s;
+}
+function hhmm(t) {
+  const d = new Date(t * 1000);
+  const p = (x) => String(x).padStart(2, '0');
+  return p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + ':00';
+}
+
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.candles = buildCandles(320);
+    this.zones = this.buildZones();
+    this.allSignals = this.buildSignals();
+    this.state = {
+      mode: props.initialMode || 'backtest',
+      running: false, progress: 0, hasResults: true, elapsedMs: 0,
+      replayIdx: 320, playing: false, speed: 4,
+      expanded: {}, selected: null,
+      overlays: { ob: true, fvg: true, sweep: true, bos: true },
+      paperRunning: true, liveArmed: false, liveRunning: false,
+      killReady: !!props.killSwitchReady, tick: 0
+    };
+    this.tickCount = 0;
+  }
+
+  buildZones() {
+    const c = this.candles;
+    const z = [];
+    const at = (i) => c[i];
+    const push = (type, i1, i2, p1, p2, dir) => z.push({ type: type, t1: at(i1).time, t2: at(i2).time, p1: p1, p2: p2, dir: dir });
+    push('ob', 38, 74, at(38).low, at(38).high, 'bull');
+    push('ob', 132, 176, at(132).low, at(132).high, 'bear');
+    push('ob', 244, 300, at(244).low, at(244).high, 'bull');
+    push('fvg', 96, 128, at(94).high, at(97).low, 'bull');
+    push('fvg', 198, 236, at(196).low, at(199).high, 'bear');
+    push('fvg', 276, 312, at(274).high, at(277).low, 'bull');
+    push('sweep', 60, 70, at(64).low - 90, at(64).low, 'bull');
+    push('sweep', 186, 196, at(190).high, at(190).high + 90, 'bear');
+    return z;
+  }
+
+  buildSignals() {
+    const r = rng(77);
+    const idxs = [46, 88, 121, 158, 190, 221, 252, 281, 300, 313];
+    return idxs.map((i, n) => {
+      const c = this.candles[i];
+      const dir = r() > 0.45 ? 'LONG' : 'SHORT';
+      const dets = DET_NAMES.map((name) => {
+        const v = Math.round((r() - 0.42) * 40) / 10;
+        return { name: name, raw: v };
+      });
+      const score = dets.filter((d) => Math.abs(d.raw) >= 0.6).length;
+      return {
+        id: 's' + n, idx: i, time: c.time, price: c.close, dir: dir, score: score,
+        dets: dets, becameTrade: score >= 3,
+        trigger: ['OB retest', 'FVG fill', 'CHoCH confirm', 'sweep reclaim', 'BOS continuation'][n % 5],
+        detail: 'ATR ' + (40 + Math.round(r() * 60)) + ' · risk 1.0R · stop ' + (c.close - (dir === 'LONG' ? 210 : -210)).toFixed(1)
+      };
+    });
+  }
+
+  componentDidMount() {
+    this.waitForLib();
+    this.liveTimer = setInterval(() => this.liveTick(), 1400);
+    this.uiTimer = setInterval(() => this.setState({ tick: Date.now() }), 1000);
+    this._resize = () => this.drawOverlays();
+    window.addEventListener('resize', this._resize);
+  }
+  componentWillUnmount() {
+    clearInterval(this.liveTimer); clearInterval(this.uiTimer);
+    clearInterval(this.runTimer); clearInterval(this.playTimer);
+    clearTimeout(this._libTimer);
+    if (this.ro) this.ro.disconnect();
+    if (this.chart) { try { this.chart.remove(); } catch (e) {} this.chart = null; this.series = null; }
+    window.removeEventListener('resize', this._resize);
+  }
+  componentDidUpdate(prevProps) {
+    if (prevProps && this.props.killSwitchReady !== prevProps.killSwitchReady) {
+      this.setState({ killReady: !!this.props.killSwitchReady });
+    }
+    this.syncSeries();
+  }
+
+  waitForLib() {
+    clearTimeout(this._libTimer);
+    if (this.chart) return;
+    if (window.LightweightCharts && this.chartEl && this.chartEl.clientWidth > 0) { this.createChart(); return; }
+    this._libTimer = setTimeout(() => this.waitForLib(), 60);
+  }
+
+  createChart() {
+    if (this.chart || !this.chartEl || !window.LightweightCharts) return;
+    const w = this.chartEl.clientWidth, h = this.chartEl.clientHeight;
+    if (!w || !h) { this.waitForLib(); return; }
+    while (this.chartEl.firstChild) this.chartEl.removeChild(this.chartEl.firstChild);
+    const LC = window.LightweightCharts;
+    this.chart = LC.createChart(this.chartEl, {
+      width: w, height: h,
+      layout: { background: { color: '#101216' }, textColor: '#79828c', fontFamily: "'IBM Plex Mono', monospace", fontSize: 11 },
+      grid: { vertLines: { color: '#191d23' }, horzLines: { color: '#191d23' } },
+      rightPriceScale: { borderColor: RULE },
+      timeScale: { borderColor: RULE, timeVisible: true, secondsVisible: false },
+      crosshair: { mode: 0, vertLine: { color: '#3a424b', labelBackgroundColor: '#2c3138' }, horzLine: { color: '#3a424b', labelBackgroundColor: '#2c3138' } },
+      handleScale: true, handleScroll: true
+    });
+    this.series = this.chart.addCandlestickSeries({
+      upColor: '#e8eaed', downColor: '#6b7078', borderVisible: false,
+      wickUpColor: '#e8eaed', wickDownColor: '#6b7078', priceLineColor: '#3a424b'
+    });
+    this.chart.timeScale().subscribeVisibleTimeRangeChange(() => this.drawOverlays());
+    if (window.ResizeObserver) {
+      this.ro = new ResizeObserver(() => {
+        if (!this.chart || !this.chartEl) return;
+        const cw = this.chartEl.clientWidth, chh = this.chartEl.clientHeight;
+        if (cw > 0 && chh > 0) { try { this.chart.resize(cw, chh, true); } catch (e) { console.warn('resize', e && e.message); } }
+        this.drawOverlays();
+      });
+      this.ro.observe(this.chartEl);
+    }
+    this.syncSeries(true);
+    const force = () => {
+      if (!this.chart || !this.chartEl) return;
+      const cw = this.chartEl.clientWidth, chh = this.chartEl.clientHeight;
+      if (cw > 0 && chh > 0) this.chart.resize(cw, chh, true);
+      this.chart.timeScale().fitContent();
+      this.drawOverlays();
+    };
+    requestAnimationFrame(() => { force(); requestAnimationFrame(force); });
+    setTimeout(force, 300);
+  }
+
+  visibleCandles() {
+    return this.state.mode === 'backtest' ? this.candles.slice(0, this.state.replayIdx) : this.candles;
+  }
+
+  syncSeries(fit) {
+    if (!this.series) return;
+    const data = this.visibleCandles();
+    const st = this.state;
+    if (this._lastMode !== st.mode || this._lastLen == null || data.length !== this._lastLen) fit = true;
+    this._lastMode = st.mode; this._lastLen = data.length;
+    this.series.setData(data);
+    const marks = [];
+    if (st.overlays.bos) {
+      [[70, 'CHoCH', 'bull'], [124, 'BOS', 'bull'], [188, 'CHoCH', 'bear'], [246, 'BOS', 'bear'], [296, 'CHoCH', 'bull']].forEach((m) => {
+        if (m[0] < data.length) marks.push({
+          time: this.candles[m[0]].time,
+          position: m[2] === 'bull' ? 'belowBar' : 'aboveBar',
+          color: m[2] === 'bull' ? '#4ade80' : '#f472b6',
+          shape: m[2] === 'bull' ? 'arrowUp' : 'arrowDown',
+          text: m[1]
+        });
+      });
+    }
+    const sel = st.selected;
+    if (sel) {
+      const s = this.allSignals.find((x) => x.id === sel);
+      if (s && s.idx < data.length) marks.push({ time: s.time, position: 'inBar', color: '#38bdf8', shape: 'circle', text: s.dir });
+    }
+    marks.sort((a, b) => a.time - b.time);
+    try { this.series.setMarkers(marks); } catch (e) { console.warn('setMarkers', e && e.message); }
+    if (fit) this.chart.timeScale().fitContent();
+    this.drawOverlays();
+  }
+
+  drawOverlays() {
+    const cv = this.overlayEl;
+    if (!cv || !this.chart || !this.series) return;
+    const w = cv.clientWidth, h = cv.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== w * dpr || cv.height !== h * dpr) { cv.width = w * dpr; cv.height = h * dpr; }
+    const ctx = cv.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const ts = this.chart.timeScale();
+    const last = this.visibleCandles();
+    const lastTime = last.length ? last[last.length - 1].time : 0;
+    this.zones.forEach((z) => {
+      if (!this.state.overlays[z.type]) return;
+      if (z.t1 > lastTime) return;
+      const x1 = ts.timeToCoordinate(z.t1);
+      const x2 = ts.timeToCoordinate(Math.min(z.t2, lastTime));
+      const y1 = this.series.priceToCoordinate(Math.max(z.p1, z.p2));
+      const y2 = this.series.priceToCoordinate(Math.min(z.p1, z.p2));
+      if (x1 == null || x2 == null || y1 == null || y2 == null) return;
+      const def = OVERLAY_DEFS.find((d) => d.key === z.type);
+      const col = def ? def.color : '#38bdf8';
+      ctx.fillStyle = col + '1f';
+      ctx.fillRect(x1, y1, Math.max(x2 - x1, 3), Math.max(y2 - y1, 2));
+      ctx.strokeStyle = col + '99';
+      ctx.lineWidth = 1;
+      ctx.setLineDash(z.type === 'sweep' ? [4, 3] : []);
+      ctx.strokeRect(x1 + 0.5, y1 + 0.5, Math.max(x2 - x1, 3), Math.max(y2 - y1, 2));
+      ctx.setLineDash([]);
+      if (x2 - x1 > 54) {
+        ctx.fillStyle = col;
+        ctx.font = "9px 'IBM Plex Mono', monospace";
+        ctx.fillText(def ? def.label : '', x1 + 5, y1 + 11);
+      }
+    });
+  }
+
+  liveTick() {
+    const st = this.state;
+    if (st.mode === 'backtest' || !this.series) return;
+    this.tickCount++;
+    const c = this.candles[this.candles.length - 1];
+    const delta = (Math.random() - 0.48) * 70;
+    c.close = +(c.close + delta).toFixed(1);
+    c.high = Math.max(c.high, c.close); c.low = Math.min(c.low, c.close);
+    if (this.tickCount % 8 === 0) {
+      this.candles.push({ time: c.time + 300, open: c.close, high: c.close, low: c.close, close: c.close });
+    }
+    this.series.update(this.candles[this.candles.length - 1]);
+    this.drawOverlays();
+    this.setState({ tick: this.tickCount });
+  }
+
+  runBacktest() {
+    if (this.state.running) return;
+    this.setState({ running: true, progress: 0, hasResults: false, elapsedMs: 0 });
+    clearInterval(this.runTimer);
+    this.runTimer = setInterval(() => {
+      this.setState((s) => {
+        const p = s.progress + 1.6;
+        if (p >= 100) { clearInterval(this.runTimer); return { progress: 100, running: false, hasResults: true, elapsedMs: s.elapsedMs + 90 }; }
+        return { progress: p, elapsedMs: s.elapsedMs + 90 };
+      });
+    }, 90);
+  }
+
+  togglePlay() {
+    const playing = !this.state.playing;
+    this.setState({ playing: playing });
+    clearInterval(this.playTimer);
+    if (playing) {
+      this.playTimer = setInterval(() => {
+        this.setState((s) => {
+          if (s.replayIdx >= this.candles.length) { clearInterval(this.playTimer); return { playing: false }; }
+          return { replayIdx: s.replayIdx + 1 };
+        });
+      }, Math.round(220 / this.state.speed));
+    }
+  }
+
+  stepSignal(dir) {
+    const idx = this.state.replayIdx;
+    const list = this.allSignals.map((s) => s.idx);
+    const next = dir > 0 ? list.find((i) => i > idx) : list.slice().reverse().find((i) => i < idx);
+    if (next != null) this.setState({ replayIdx: next + 6 });
+  }
+
+  selectSignal(s) {
+    this.setState((st) => {
+      const ex = Object.assign({}, st.expanded);
+      ex[s.id] = !ex[s.id];
+      const patch = { expanded: ex, selected: ex[s.id] ? s.id : null };
+      if (ex[s.id] && st.mode === 'backtest') patch.replayIdx = Math.max(st.replayIdx, s.idx + 6);
+      return patch;
+    });
+    if (this.chart && s) {
+      const ts = this.chart.timeScale();
+      ts.setVisibleRange({ from: s.time - 60 * 300, to: s.time + 40 * 300 });
+    }
+  }
+
+  connState() {
+    const c = this.props.paperConnection || 'healthy';
+    if (!this.state.paperRunning) return 'idle';
+    return c;
+  }
+
+  renderVals() {
+    const st = this.state;
+    const mode = st.mode;
+    const isBacktest = mode === 'backtest', isPaper = mode === 'paper', isLive = mode === 'live';
+    const modeColor = isBacktest ? '#8b949e' : isPaper ? '#d99a2b' : '#e0483d';
+    const tab = (m) => ({
+      bg: mode === m ? '#1a1e24' : 'transparent',
+      fg: mode === m ? (m === 'backtest' ? '#d8dce2' : m === 'paper' ? '#e8b84f' : '#e8756a') : '#79828c',
+      line: mode === m ? (m === 'backtest' ? '#8b949e' : m === 'paper' ? '#d99a2b' : '#e0483d') : 'transparent'
+    });
+    const tb = tab('backtest'), tp = tab('paper'), tl = tab('live');
+
+    const conn = this.connState();
+    const connMap = {
+      healthy: { dot: '#4ade80', text: '#8fbf9b', label: 'WS CONNECTED' },
+      reconnecting: { dot: '#d99a2b', text: '#e8b84f', label: 'WS RECONNECTING' },
+      dropped: { dot: '#e0483d', text: '#e8756a', label: 'WS DROPPED' },
+      idle: { dot: '#565d66', text: '#79828c', label: 'WS IDLE' }
+    };
+    const cm = connMap[conn];
+
+    const lastC = this.visibleCandles();
+    const lastPrice = lastC.length ? '$' + lastC[lastC.length - 1].close.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : '—';
+
+    const cutoff = isBacktest ? st.replayIdx : this.candles.length;
+    const sigs = this.allSignals.filter((s) => s.idx < cutoff).slice().reverse();
+    const feedSignals = sigs.map((s) => {
+      const dirColor = s.dir === 'LONG' ? '#e8eaed' : '#8b949e';
+      return {
+        id: s.id, dir: s.dir, dirColor: dirColor,
+        price: '$' + s.price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 }),
+        timeLabel: hhmm(s.time), trigger: s.trigger, score: String(s.score),
+        scoreColor: s.score >= 3 ? '#38bdf8' : '#565d66',
+        becameTrade: s.becameTrade, detail: s.detail,
+        expanded: !!st.expanded[s.id], caret: st.expanded[s.id] ? '▾' : '▸',
+        rowBg: st.selected === s.id ? '#171d24' : 'transparent',
+        onToggle: () => this.selectSignal(s),
+        detectors: s.dets.map((d) => {
+          const supportive = (s.dir === 'LONG' && d.raw > 0) || (s.dir === 'SHORT' && d.raw < 0);
+          const neutral = Math.abs(d.raw) < 0.6;
+          return {
+            name: d.name,
+            value: (d.raw > 0 ? '+' : '') + d.raw.toFixed(1),
+            color: neutral ? '#565d66' : supportive ? '#38bdf8' : '#e07b53',
+            border: neutral ? '#242930' : supportive ? '#2c5c73' : '#5c3a2c'
+          };
+        })
+      };
+    });
+
+    const tradeRows = [
+      ['02:15', 'LONG', '63,180.4 → 63,742.0', '0.045 BTC', 25.29, '+1.8R', '4/5', 'TP'],
+      ['03:40', 'SHORT', '63,910.2 → 64,102.6', '0.045 BTC', -8.66, '−0.7R', '3/5', 'SL'],
+      ['05:05', 'LONG', '63,540.8 → 64,020.1', '0.050 BTC', 23.96, '+1.6R', '5/5', 'TP'],
+      ['07:20', 'LONG', '64,110.0 → 64,038.4', '0.050 BTC', -3.58, '−0.3R', '3/5', 'structure flip'],
+      ['09:45', 'SHORT', '64,480.5 → 63,905.7', '0.048 BTC', 27.59, '+2.1R', '4/5', 'TP'],
+      ['11:30', 'SHORT', '63,995.1 → 64,180.9', '0.048 BTC', -8.91, '−0.8R', '3/5', 'SL']
+    ].map((t, i) => ({
+      time: t[0], side: t[1], sideColor: t[1] === 'LONG' ? '#e8eaed' : '#8b949e',
+      prices: t[2], size: t[3], pnl: fmtSigned(t[4]), pnlColor: t[4] >= 0 ? '#e8eaed' : '#6b7078',
+      r: t[5], conf: t[6], reason: t[7], rowBg: i % 2 ? '#141317' : 'transparent'
+    }));
+    const showTrades = isBacktest ? st.hasResults : (isPaper ? st.paperRunning : st.liveRunning);
+    const trades = showTrades ? (isLive ? tradeRows.slice(0, 3) : tradeRows) : [];
+
+    const eq = [];
+    const bnh = [];
+    const r = rng(31);
+    let e = 0, b = 0;
+    for (let i = 0; i <= 60; i++) {
+      e += (r() - 0.32) * 3.2; b += (r() - 0.45) * 4.4;
+      eq.push([i * 10, 180 - Math.max(e, -8) * 1.6]);
+      bnh.push([i * 10, 180 - Math.max(b, -20) * 1.6]);
+    }
+    const pts = (a) => a.map((p) => p[0].toFixed(0) + ',' + Math.max(6, Math.min(194, p[1])).toFixed(1)).join(' ');
+
+    const elapsedS = st.elapsedMs / 1000;
+    const totalEstS = st.progress > 0 ? elapsedS / (st.progress / 100) : 0;
+
+    const killReady = st.killReady;
+    const liveArmed = st.liveArmed, liveRunning = st.liveRunning;
+
+    return {
+      isBacktest: isBacktest, isPaper: isPaper, isLive: isLive,
+      goBacktest: () => this.setState({ mode: 'backtest' }),
+      goPaper: () => this.setState({ mode: 'paper' }),
+      goLive: () => this.setState({ mode: 'live' }),
+      tabBgBacktest: tb.bg, tabFgBacktest: tb.fg, tabLineBacktest: tb.line,
+      tabBgPaper: tp.bg, tabFgPaper: tp.fg, tabLinePaper: tp.line,
+      tabBgLive: tl.bg, tabFgLive: tl.fg, tabLineLive: tl.line,
+
+      statusBacktest: st.running ? 'running ' + Math.round(st.progress) + '%' : (st.hasResults ? 'complete' : 'idle'),
+      statusPaper: st.paperRunning ? (conn === 'healthy' ? 'running' : conn) : 'stopped',
+      dotPaper: st.paperRunning ? cm.dot : '#565d66',
+      dotPaperAnim: st.paperRunning && conn !== 'healthy' ? 'smcpulse 1s infinite' : 'none',
+      statusLive: liveRunning ? 'trading' : (killReady ? 'armed · not started' : 'locked'),
+      statusLiveColor: liveRunning ? '#e8756a' : (killReady ? '#d99a2b' : '#79828c'),
+      dotLive: liveRunning ? '#e0483d' : '#565d66',
+
+      paramFrom: this.state.from || '2023-01-01',
+      paramTo: this.state.to || '2026-06-30',
+      paramThreshold: this.state.threshold || '3',
+      paramFee: this.state.fee || '0.10',
+      paramSlippage: this.state.slippage || '5',
+      setFrom: (e2) => this.setState({ from: e2.target.value }),
+      setTo: (e2) => this.setState({ to: e2.target.value }),
+      setThreshold: (e2) => this.setState({ threshold: e2.target.value }),
+      setFee: (e2) => this.setState({ fee: e2.target.value }),
+      setSlippage: (e2) => this.setState({ slippage: e2.target.value }),
+      paramSummary: 'fees ' + (this.state.fee || '0.10') + '% taker + ' + (this.state.slippage || '5') + 'bps slippage applied per fill',
+
+      running: st.running,
+      runBtnLabel: st.running ? 'RUNNING…' : 'RUN BACKTEST',
+      runBtnBg: st.running ? '#1a1e24' : '#2c5c73',
+      runBtnFg: st.running ? '#565d66' : '#d7f0fb',
+      runBtnBorder: st.running ? '#2c3138' : '#38bdf8',
+      runBtnCursor: st.running ? 'not-allowed' : 'pointer',
+      runBacktest: () => this.runBacktest(),
+      progressPct: st.progress.toFixed(0),
+      progressWidth: st.progress.toFixed(1) + '%',
+      candlesProcessed: Math.round(this.candles.length * 1240 * st.progress / 100).toLocaleString('en-US'),
+      candlesTotal: this.candles.length,
+      elapsed: elapsedS.toFixed(1) + 's',
+      remaining: Math.max(0, totalEstS - elapsedS).toFixed(1) + 's',
+
+      togglePaper: () => this.setState((s) => ({ paperRunning: !s.paperRunning })),
+      paperBtnLabel: st.paperRunning ? 'STOP PAPER LOOP' : 'START PAPER LOOP',
+      paperBtnBg: st.paperRunning ? '#2a1d0c' : '#1a1e24',
+      paperBtnFg: st.paperRunning ? '#e8b84f' : '#a9b1ba',
+      paperBtnBorder: st.paperRunning ? '#6b4a12' : '#2c3138',
+      paperBalance: fmtUSD(10482.55),
+      paperPnl: fmtSigned(482.55),
+      paperPnlColor: '#e8eaed',
+      paperPosition: st.paperRunning ? 'LONG 0.045 BTC @ 63,742' : 'flat',
+      connDegraded: st.paperRunning && conn !== 'healthy',
+      connBannerTitle: conn === 'dropped' ? 'WEBSOCKET DROPPED' : 'WEBSOCKET RECONNECTING',
+      connBannerBody: conn === 'dropped'
+        ? 'No market data since 00:00:42. The bot is not watching the market — positions are unmanaged until the socket returns.'
+        : 'Attempt 3 of 10. Candles may be stale; no new signals are being evaluated.',
+      connDotColor: cm.dot, connTextColor: cm.text, connLabel: cm.label,
+      connLastMsg: conn === 'healthy' ? '0.4s ago' : conn === 'reconnecting' ? '11s ago' : '42s ago',
+
+      killReady: killReady,
+      killState: killReady ? 'READY' : 'BLOCKED',
+      killColor: killReady ? '#4ade80' : '#e0483d',
+      killDot: killReady ? '#4ade80' : '#e0483d',
+      killBg: killReady ? '#111a13' : '#1d1113',
+      killReason: killReady
+        ? 'All preflight checks pass. Withdrawal permission is disabled on the API key; daily loss limit and drawdown halt are configured.'
+        : 'API keys present, but withdrawal permission is not disabled on the key. Live trading stays locked until the key is restricted to trade-only.',
+      killChecked: '14s ago',
+      recheck: () => this.setState((s) => ({ killReady: !s.killReady, liveArmed: false })),
+
+      liveArmed: liveArmed,
+      liveBtnDisabled: !killReady,
+      liveBtnLabel: liveRunning ? 'STOP LIVE TRADING' : (liveArmed ? 'START LIVE TRADING' : 'ARM'),
+      liveBtnBg: !killReady ? '#17181b' : (liveArmed || liveRunning ? '#5c2621' : '#1a1e24'),
+      liveBtnFg: !killReady ? '#4a5158' : (liveArmed || liveRunning ? '#f5c9c4' : '#e8756a'),
+      liveBtnBorder: !killReady ? '#242930' : (liveArmed || liveRunning ? '#e0483d' : '#5c2621'),
+      liveBtnCursor: killReady ? 'pointer' : 'not-allowed',
+      liveAction: () => {
+        if (!this.state.killReady) return;
+        this.setState((s) => s.liveRunning ? { liveRunning: false, liveArmed: false } : (s.liveArmed ? { liveRunning: true, liveArmed: false } : { liveArmed: true }));
+      },
+      disarm: () => this.setState({ liveArmed: false }),
+      liveHint: !killReady ? 'disabled — kill switch not ready' : (liveRunning ? 'trading real funds since 09:12 UTC' : (liveArmed ? 'review the summary below, then start' : 'requires a second confirmation step')),
+      liveHintColor: !killReady ? '#565d66' : (liveRunning ? '#e8756a' : '#79828c'),
+      liveBalance: fmtUSD(4218.93),
+      livePnl: fmtSigned(-38.4),
+      livePnlColor: '#6b7078',
+      livePosition: liveRunning ? 'SHORT 0.018 BTC @ 64,102' : 'flat',
+      riskSummary: [
+        { label: 'POSITION SIZE / TRADE', value: '1.5% · ~0.018 BTC' },
+        { label: 'DAILY LOSS LIMIT', value: '−$150.00' },
+        { label: 'MAX DRAWDOWN AUTO-HALT', value: '−8.0%' },
+        { label: 'CONFLUENCE THRESHOLD', value: '3 of 5' },
+        { label: 'BALANCE AT ARM', value: fmtUSD(4218.93) }
+      ],
+
+      overlayToggles: OVERLAY_DEFS.map((d) => ({
+        label: d.label, swatch: st.overlays[d.key] ? d.color : '#2c3138',
+        bg: st.overlays[d.key] ? '#1a1e24' : 'transparent',
+        fg: st.overlays[d.key] ? '#d8dce2' : '#565d66',
+        border: st.overlays[d.key] ? '#2c3138' : '#242930',
+        onToggle: () => this.setState((s) => {
+          const o = Object.assign({}, s.overlays); o[d.key] = !o[d.key]; return { overlays: o };
+        })
+      })),
+      chartCaption: isBacktest ? 'REPLAY · 5m' : 'LIVE STREAM · 5m',
+      lastPrice: lastPrice,
+      chartHeight: (this.props.chartHeight || 440) + 'px',
+      feedHeight: ((this.props.chartHeight || 440) + (isBacktest ? 82 : 40)) + 'px',
+      chartRef: this._chartRef || (this._chartRef = (el) => { if (el && el !== this.chartEl) { this.chartEl = el; this.createChart(); } }),
+      overlayRef: this._overlayRef || (this._overlayRef = (el) => { if (el && el !== this.overlayEl) { this.overlayEl = el; this.drawOverlays(); } }),
+
+      replayIdx: st.replayIdx,
+      setReplay: (e2) => this.setState({ replayIdx: +e2.target.value }),
+      replayLabel: hhmm(this.candles[Math.min(st.replayIdx, this.candles.length) - 1].time) + ' · ' + st.replayIdx + '/' + this.candles.length,
+      playLabel: st.playing ? '❚❚ PAUSE' : '▶ PLAY',
+      togglePlay: () => this.togglePlay(),
+      prevSignal: () => this.stepSignal(-1),
+      nextSignal: () => this.stepSignal(1),
+      speeds: [1, 4, 16].map((v) => ({
+        label: v + '×', bg: st.speed === v ? '#1a1e24' : 'transparent',
+        fg: st.speed === v ? '#38bdf8' : '#565d66', border: st.speed === v ? '#2c5c73' : '#242930',
+        onPick: () => this.setState({ speed: v }, () => { if (this.state.playing) { this.setState({ playing: false }); this.togglePlay(); } })
+      })),
+
+      signals: feedSignals,
+      feedEmpty: feedSignals.length === 0,
+      feedEmptyText: isBacktest ? 'No signals yet at this replay position.' : 'Bot stopped — market data still streaming,\nbut no signals are being evaluated.',
+      feedMeta: feedSignals.length + ' signals · thr ' + (this.state.threshold || '3') + '/5',
+
+      showResults: isBacktest && st.hasResults,
+      metrics: [
+        { label: 'Profit factor', value: '1.84', baseline: '—', color: '#e8eaed' },
+        { label: 'Sharpe ratio', value: '1.31', baseline: 'B&H 0.42', color: '#e8eaed' },
+        { label: 'Max drawdown', value: '−11.4%', baseline: 'B&H −38.2%', color: '#6b7078' },
+        { label: 'Cumulative return', value: '+62.7%', baseline: 'B&H +41.3%', color: '#e8eaed' },
+        { label: 'Annualised return', value: '+17.9%', baseline: 'B&H +11.8%', color: '#e8eaed' },
+        { label: 'Trades / win rate', value: '412 · 47%', baseline: '—', color: '#a9b1ba' },
+        { label: 'Avg R per trade', value: '+0.31R', baseline: '—', color: '#e8eaed' },
+        { label: 'Fees + slippage paid', value: '−$1,204', baseline: '—', color: '#6b7078' }
+      ],
+      eqPoints: pts(eq), bnhPoints: pts(bnh),
+      exportCsv: () => {},
+
+      logTitle: isBacktest ? 'TRADE LOG · SIMULATED' : isPaper ? 'TRADE LOG · TESTNET FILLS' : 'TRADE LOG · REAL FILLS',
+      logMeta: trades.length + ' shown' + (isBacktest ? ' of 412' : ''),
+      trades: trades,
+      logEmpty: trades.length === 0,
+      logEmptyText: isLive ? 'No live fills. Live trading has not been started.' : 'No fills yet.'
+    };
+  }
+}
+
+</script>
+</body>
+</html>
