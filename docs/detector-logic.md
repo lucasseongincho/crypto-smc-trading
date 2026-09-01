@@ -7,22 +7,30 @@ interpreting backtest results, and "I'll remember" isn't a substitute for a writ
 record.
 
 All line numbers below are against `data/smc.py` and `signals/smc_aggregator.py` as of
-this commit.
+this commit. **Update note:** `min_ob_body_ratio`, `min_fvg_gap_ratio`, and
+`min_break_distance` were added after the original audit below — they follow the exact
+same pattern `lookback_bars` already used (a named parameter, a sensible-but-off
+default, an explicit TODO comment), not the `min_confluence` pattern (no default,
+enforced-required). Defaulted to `0.0`, which reproduces the prior hardcoded-off
+behavior byte-for-byte — nothing about detector *output* changed, only what's now
+configurable. See the [summary table](#summary-every-parameter-in-one-table) for the
+full up-to-date parameter list.
 
 **Headline finding**: "liquidity sweep" and "fakeout" are not two detectors — there is
 one function, `detect_fakeout`, and it is not implemented as "a BOS/CHoCH that got
 invalidated." See [Liquidity sweep / fakeout](#liquidity-sweep--fakeout-one-detector-not-two)
 below.
 
-**Second headline finding**: order block validity has **no** BOS/CHoCH gating, no
-mitigation tracking, and no size/volume filter anywhere in this codebase — not in the
-detector, not in the aggregator, not in the one other place `order_blocks` gets read
-(`backtest/runner.py`'s stop-loss placement). See
-[Order block](#order-block-detect_order_blocks-lines-26-51).
+**Second headline finding**: order block validity has **no** BOS/CHoCH gating and no
+mitigation tracking anywhere in this codebase — not in the detector, not in the
+aggregator, not in the one other place `order_blocks` gets read (`backtest/runner.py`'s
+stop-loss placement). A minimum-size filter now exists (`min_ob_body_ratio`, defaulted
+off) — see [Order block](#order-block-detect_order_blocks-lines-52-92) — but BOS-gating
+and mitigation tracking are still just not built.
 
 ---
 
-## Swing detection (`detect_swings`, lines 79-117)
+## Swing detection (`detect_swings`, lines 145-183)
 
 **Literal condition.** For each candidate index `i` (only indices with at least
 `left_bars` candles before and `right_bars` candles after are even considered — the
@@ -45,7 +53,7 @@ mirror image on `"low"` with `<=`.
 |---|---|---|---|
 | `left_bars` | `3` | `detect_swings()` signature | Hardcoded literal default. **Not** flagged as a TODO anywhere in the code, unlike `lookback_bars` — but just as unvalidated for 5-minute crypto bars. |
 | `right_bars` | `3` | `detect_swings()` signature | Same as above. |
-| Both, passed through as | `swing_left_bars=3`, `swing_right_bars=3` | `compute_smc_features()` signature (lines 257-258) | Hardcoded defaults, no TODO comment. |
+| Both, passed through as | `swing_left_bars=3`, `swing_right_bars=3` | `compute_smc_features()` signature (lines 343-344) | Hardcoded defaults, no TODO comment. |
 
 **Confirmation lag.** A swing at index `i` cannot be known until `i + right_bars`
 candles later (you need `right_bars` future candles to confirm nothing broke it) —
@@ -59,9 +67,9 @@ even 1-and-1. 3-and-3 is stricter/slower to confirm than the more common version
 worth knowing when comparing "how many swings did this find" against another tool or
 another timeframe.
 
-### `classify_swing_trend` (lines 120-136)
+### `classify_swing_trend` (lines 186-202)
 
-Not one of the 6 detectors the question asked about by name, but it's the fourth
+Not one of the 6 detectors the original audit asked about by name, but it's the fourth
 confluence vote (`swing_trend`) — documented here since it's small.
 
 **Literal condition**, using only the **last two** swing highs and **last two** swing
@@ -86,7 +94,7 @@ docstring already says.
 
 ---
 
-## BOS / CHoCH (`detect_bos_choch`, lines 139-218)
+## BOS / CHoCH (`detect_bos_choch`, lines 216-304)
 
 This is the most stateful detector and the one most worth reading carefully, because
 two of its behaviors are easy to get wrong from a paraphrase.
@@ -97,7 +105,7 @@ unbroken candidate swing high/low dicts, or `None`), `bias` (`None` / `"bullish"
 
 **Per bar `i` (0..len(window)-1), two separate mechanisms, in this order:**
 
-**(a) Swing-confirmation phase** (lines 176-196) — a `while` loop that processes every
+**(a) Swing-confirmation phase** (lines 262-282) — a `while` loop that processes every
 swing whose confirmation point has arrived: `swings_sorted[swing_ptr]["index"] +
 right_bars <= i`. For each newly-confirmed swing `s`:
 
@@ -111,19 +119,20 @@ right_bars <= i`. For each newly-confirmed swing `s`:
   high.
 - Symmetric for `"low"` swings against `pending_low`, using `<` and `bias =
   "bearish"`.
+- **Not gated by `min_break_distance`** — see below.
 
-**(b) Close-crossing phase** (lines 198-216) — runs every bar, independent of whether
+**(b) Close-crossing phase** (lines 284-302) — runs every bar, independent of whether
 phase (a) did anything this bar:
 
 - `close = float(window.iloc[i]["close"])`.
-- **if** `pending_high is not None and close > pending_high["price"]`: fire
-  `event_type = "BOS" if bias == "bullish" else "CHoCH"`, `direction="bullish"`,
-  `price` = the (old) `pending_high` price, `index=i`. Set `bias="bullish"` and — unlike
-  phase (a) — **`pending_high = None`** (the level is *consumed*, not replaced; no new
-  pending high exists until the next swing high is confirmed in a later bar's phase
-  (a)).
-- **elif** `pending_low is not None and close < pending_low["price"]`: mirror image,
-  `pending_low = None`.
+- **if** `pending_high is not None and close > pending_high["price"] +
+  min_break_distance`: fire `event_type = "BOS" if bias == "bullish" else "CHoCH"`,
+  `direction="bullish"`, `price` = the (old) `pending_high` price, `index=i`. Set
+  `bias="bullish"` and — unlike phase (a) — **`pending_high = None`** (the level is
+  *consumed*, not replaced; no new pending high exists until the next swing high is
+  confirmed in a later bar's phase (a)).
+- **elif** `pending_low is not None and close < pending_low["price"] -
+  min_break_distance`: mirror image, `pending_low = None`.
 - This is `if`/`elif`, not two independent `if`s — only one of the two can fire per
   bar. In a coherent structure (`pending_low < pending_high`) this rarely matters in
   practice, but it's the literal behavior.
@@ -165,7 +174,7 @@ with **no** event — this is intentional, not a gap.
 | Param | Default | Status |
 |---|---|---|
 | `right_bars` | `3`, reused from `swing_right_bars` | Not independently configurable — tied 1:1 to the swing detector's `right_bars`. Hardcoded, no TODO. |
-| Break threshold | **none** | Any `close` beyond the level by any amount — a single tick — counts. No minimum-distance / minimum-% filter exists anywhere in this function. |
+| `min_break_distance` | `0.0` (`DEFAULT_MIN_BREAK_DISTANCE`, line 213) | **Explicit TODO.** Raw price distance (not an ATR ratio like the OB/FVG filters — that's what was asked for) the close must clear beyond the level. `0.0` reproduces the prior "any close beyond the level, however small, breaks it" behavior exactly. **Scoping choice, documented in the function's own docstring:** applies only to phase (b), the close-crossing check — phase (a)'s wick-based swing-supersession check is unaffected, so a nonzero `min_break_distance` can still be circumvented via that path. |
 
 **What the aggregator actually reads.** `compute_smc_features` exposes
 `"structure_bias": structure_events[-1]["direction"] if structure_events else None` —
@@ -181,11 +190,17 @@ just the **direction** of the chronologically last event, whatever its `type`.
 
 ---
 
-## Order block (`detect_order_blocks`, lines 26-51)
+## Order block (`detect_order_blocks`, lines 52-92)
 
 **Literal condition.** For each adjacent pair `prev = window.iloc[i-1]`, `curr =
 window.iloc[i]`, `i` in `1..len(window)-1`:
 
+- First, a size gate: `prev_body = abs(prev["close"] - prev["open"])`; if `prev_body <
+  min_ob_body_ratio * atr.iloc[i-1]`, `continue` (skip this pair entirely, regardless
+  of what the engulf check below would have found). `atr` is `_atr(window)` (lines
+  26-40, a standard 14-period true-range ATR computed once per call) — the reference
+  point is `atr.iloc[i-1]`, i.e. ATR *as of the candle being sized* (`prev`), not
+  incorporating `curr`.
 - Bullish: `prev["close"] < prev["open"]` (prev is a down candle) **and**
   `curr["close"] > curr["open"]` (curr is an up candle) **and** `curr["close"] >
   prev["high"]` (curr's close breaks above prev's high). If all three: append
@@ -194,15 +209,22 @@ window.iloc[i]`, `i` in `1..len(window)-1`:
 - Bearish: mirror image — `prev close > prev open`, `curr close < curr open`, `curr
   close < prev["low"]`; zone = `prev`'s high/low.
 
-This is a plain 2-candle engulfing pattern, checked independently for every adjacent
-pair in the window (no deduplication, no "is this still the most relevant one").
+This is a plain 2-candle engulfing pattern (now with a size gate), checked
+independently for every adjacent pair in the window (no deduplication, no "is this
+still the most relevant one").
 
-**Parameters:** none. No minimum body size, no minimum range, no volume filter, no
-displacement-size requirement.
+**Parameters:**
+
+| Param | Default | Status |
+|---|---|---|
+| `min_ob_body_ratio` | `0.0` (`DEFAULT_MIN_OB_BODY_RATIO`, line 49) | **Explicit TODO.** Ratio of `prev`'s candle body to `_atr(window)` at that point — a ratio rather than a raw price threshold, since BTC's price scale drifts too much for a fixed dollar minimum to stay meaningful (same reasoning that flagged `backtest/risk.py`'s absolute-dollar `min_sl_distance` for re-validation; solved with a ratio here instead of a dollar figure). `0.0` reproduces the prior "any body size qualifies" behavior exactly. |
+
+Still **no** minimum range/wick filter, no volume filter, and — as before —
+**no BOS-gating or mitigation tracking at all** (see below).
 
 **Directly answering: is order block validity gated on a subsequent BOS here?**
-**No.** `detect_order_blocks(window)` takes only `window` — it has no access to
-`swings` or `structure_events` and is called (line 273) *before* `detect_swings`/
+**No**, still. `detect_order_blocks(window, min_ob_body_ratio)` has no access to
+`swings` or `structure_events` and is called (line 362) *before* `detect_swings`/
 `detect_bos_choch` even run in `compute_smc_features`. There is no code path,
 anywhere in this repository, that checks "did this order block precede/cause a
 break of structure" before including it in `order_blocks`, before the aggregator
@@ -210,49 +232,63 @@ counts it (`smc_aggregator.py` lines 97-103, which reads only `order_blocks[-1]`
 the single most recent one, full stop), or before `backtest/runner.py`'s
 `_structural_stop_loss` (lines 110-120) uses it for stop placement (same pattern:
 `order_blocks[-1] if order_blocks else None`, no BOS check, no mitigation check).
+The new size filter changes *which* engulfs qualify, not *how* validity is decided.
 
 > **Divergence from textbook.** Stricter ICT-style definitions typically require an
 > order block to be the last opposite candle *before an impulsive move that breaks
 > structure* — i.e., BOS-gated by construction — and often track whether price has
 > since traded back through the zone ("mitigated") before treating it as still
-> valid. None of that exists here. This implementation will flag **any** 2-candle
-> engulf as an order block, valid or not, structurally significant or not, mitigated
-> or not, for as long as it's the most recent one in the lookback window.
+> valid. Neither exists here. This implementation flags **any** 2-candle engulf
+> clearing the (currently off) size gate as an order block, valid or not,
+> structurally significant or not, mitigated or not, for as long as it's the most
+> recent one in the lookback window.
 
 ---
 
-## FVG (`detect_fvg`, lines 54-76)
+## FVG (`detect_fvg`, lines 104-142)
 
 **Literal condition.** For `candle_1 = window.iloc[i-2]`, `candle_3 =
 window.iloc[i]`, `i` in `2..len(window)-1` — **`candle_2` (`window.iloc[i-1]`) is
 never read or assigned to a variable at all**:
 
-- Bullish: `candle_3["low"] > candle_1["high"]` → `{"type": "bullish", "top":
-  candle_3["low"], "bottom": candle_1["high"], ...}`.
-- Bearish: `candle_3["high"] < candle_1["low"]` → `{"type": "bearish", "top":
-  candle_1["low"], "bottom": candle_3["high"], ...}`.
+- `min_gap = min_fvg_gap_ratio * atr.iloc[i-2]` — `atr` is the same `_atr(window)`
+  helper order blocks use; the reference point is `candle_1`'s position (`i-2`), not
+  `candle_3`'s, deliberately excluding the gap-forming candles themselves from the
+  volatility baseline used to judge whether the gap they form is significant.
+- Bullish: `candle_3["low"] > candle_1["high"]` **and** `gap = candle_3["low"] -
+  candle_1["high"] >= min_gap` → `{"type": "bullish", "top": candle_3["low"],
+  "bottom": candle_1["high"], ...}`.
+- Bearish: `candle_3["high"] < candle_1["low"]` **and** `gap = candle_1["low"] -
+  candle_3["high"] >= min_gap` → `{"type": "bearish", "top": candle_1["low"],
+  "bottom": candle_3["high"], ...}`.
 
 This *is* the standard 3-candle FVG definition (a gap between candle 1 and candle 3
 that skips candle 2's range entirely) — no divergence in kind.
 
-**Parameters:** none. **No minimum gap size** — a gap of a single price increment
-counts exactly the same as a large one. No filter on candle 2's range/momentum
-(some FVG variants require candle 2 to be a large/impulsive candle; this
-implementation doesn't look at candle 2 at all, for any purpose). No mitigation
-check — same as order blocks, only `fvgs[-1]` (the most recent) is read by the
-aggregator (lines 105-111), with no check for whether price has since traded back
-through the gap.
+**Parameters:**
+
+| Param | Default | Status |
+|---|---|---|
+| `min_fvg_gap_ratio` | `0.0` (`DEFAULT_MIN_FVG_GAP_RATIO`, line 101) | **Explicit TODO.** Same ATR-ratio unit as `min_ob_body_ratio`, for consistency. `0.0` reproduces the prior "any nonzero gap qualifies" behavior exactly. |
+
+Still no filter on candle 2's range/momentum (some FVG variants require candle 2 to
+be a large/impulsive candle; this implementation doesn't look at candle 2 at all, for
+any purpose). No mitigation check — same as order blocks, only `fvgs[-1]` (the most
+recent) is read by the aggregator (lines 105-111), with no check for whether price
+has since traded back through the gap.
 
 ---
 
-## Liquidity sweep / fakeout: one detector, not two (`detect_fakeout`, lines 221-245)
+## Liquidity sweep / fakeout: one detector, not two (`detect_fakeout`, lines 307-331)
 
-The question's list treats "liquidity sweep" and "fakeout" as separate detectors.
-**They are not** — there is exactly one function, `detect_fakeout`, and its output
-types are literally named `"BULL_FAKEOUT"` / `"BEAR_FAKEOUT"`. Its docstring calls it
-a liquidity sweep ("a wick past the last swing that closes back on the other side");
-the function/type names call it a fakeout. Same code, two names, no independent
-"liquidity sweep" concept exists anywhere else in this file.
+The original audit's question list treated "liquidity sweep" and "fakeout" as
+separate detectors. **They are not** — there is exactly one function,
+`detect_fakeout`, and its output types are literally named `"BULL_FAKEOUT"` /
+`"BEAR_FAKEOUT"`. Its docstring calls it a liquidity sweep ("a wick past the last
+swing that closes back on the other side"); the function/type names call it a
+fakeout. Same code, two names, no independent "liquidity sweep" concept exists
+anywhere else in this file. (No new parameter was added here — this detector wasn't
+part of the size/distance-filter request.)
 
 **Literal condition.** Only ever looks at the **last two candles** in the window —
 `curr = window.iloc[-1]`, `prev = window.iloc[-2]` — and the **most recently
@@ -319,15 +355,22 @@ guard skips it).
 | Swing (`detect_swings`) | `left_bars` | `3` | Hardcoded default. **Not** TODO-flagged anywhere. |
 | Swing | `right_bars` | `3` | Hardcoded default. **Not** TODO-flagged anywhere. |
 | BOS/CHoCH (`detect_bos_choch`) | `right_bars` | `3` (= swing's `right_bars`) | Hardcoded, reused, not independent. |
-| BOS/CHoCH | break threshold | none | Not a parameter — doesn't exist. Any `close` beyond the level, however small, breaks it. |
-| Order block (`detect_order_blocks`) | any threshold | none | Not a parameter — doesn't exist. No size/volume/BOS-gating/mitigation check. |
-| FVG (`detect_fvg`) | minimum gap size | none | Not a parameter — doesn't exist. Any nonzero gap counts. |
-| Fakeout/sweep (`detect_fakeout`) | candles allowed before invalidation | fixed at 2 (structural, not a parameter) | Not configurable — baked into which indices (`[-1]`, `[-2]`) are read. |
+| BOS/CHoCH | `min_break_distance` | `0.0` (`DEFAULT_MIN_BREAK_DISTANCE`) | **Explicit TODO.** Raw price distance; applies only to the close-crossing check, not the wick-based swing-supersession check (documented scoping choice). |
+| Order block (`detect_order_blocks`) | `min_ob_body_ratio` | `0.0` (`DEFAULT_MIN_OB_BODY_RATIO`) | **Explicit TODO.** Ratio of candle body to `_atr(window)`. Still no BOS-gating or mitigation check. |
+| FVG (`detect_fvg`) | `min_fvg_gap_ratio` | `0.0` (`DEFAULT_MIN_FVG_GAP_RATIO`) | **Explicit TODO.** Same ATR-ratio unit as the order block filter. |
+| Fakeout/sweep (`detect_fakeout`) | candles allowed before invalidation | fixed at 2 (structural, not a parameter) | Not configurable — baked into which indices (`[-1]`, `[-2]`) are read. No new parameter added here. |
 | `compute_smc_features` | `lookback_bars` | `90` (`DEFAULT_LOOKBACK_BARS`) | **Explicit TODO** — tuned for daily stock bars in tradingagents-kr, flagged in-code as needing its own validation for 5m bars. |
 | `SMCSignalAggregator` | `min_confluence` | none — constructor **raises `ValueError`** if not passed explicitly | **Explicit TODO by design** — no default exists on purpose; every caller must pass a value. |
 
-Note the asymmetry: `lookback_bars` and `min_confluence` are the two parameters
-that got explicit TODO comments and (for `min_confluence`) an enforced
-required-argument guard. `swing_left_bars`/`swing_right_bars`/the BOS `right_bars`
-are exactly as unvalidated for 5-minute BTC/USD bars, but nothing in the code flags
-them the same way — they're silently trusted at their literal default of `3`.
+All three new detector-level filters (`min_ob_body_ratio`, `min_fvg_gap_ratio`,
+`min_break_distance`) default to `0.0`, verified to reproduce the exact prior output
+of `compute_smc_features` on real snapshot data (see `tests/test_smc.py`'s
+`TestNewSizeFilterParametersDefaultToOff`) — this pass added visibility and
+configurability, not a behavior change.
+
+Note the remaining asymmetry: `lookback_bars`, `min_confluence`, and now
+`min_ob_body_ratio`/`min_fvg_gap_ratio`/`min_break_distance` all carry explicit TODO
+comments (and for `min_confluence`, an enforced required-argument guard) flagging
+them as unvalidated for 5-minute BTC/USD bars. `swing_left_bars`/`swing_right_bars`/
+the BOS `right_bars` are exactly as unvalidated, but nothing in the code flags them
+the same way yet — they're still silently trusted at their literal default of `3`.

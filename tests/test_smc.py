@@ -12,7 +12,7 @@ import unittest
 
 import pandas as pd
 
-from data.smc import compute_smc_features, detect_bos_choch, detect_swings
+from data.smc import compute_smc_features, detect_bos_choch, detect_fvg, detect_order_blocks, detect_swings
 
 
 def _df_from_ohlc(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
@@ -111,6 +111,55 @@ class TestBosChochNoSpuriousEventOnTightening(unittest.TestCase):
 
         events = detect_bos_choch(self.df, swings, right_bars=3)
         self.assertEqual(events, [])
+
+
+class TestNewSizeFilterParametersDefaultToOff(unittest.TestCase):
+    """min_ob_body_ratio/min_fvg_gap_ratio/min_break_distance were added so these
+    previously-invisible, hardcoded-off assumptions are visible and configurable
+    (see docs/detector-logic.md). Confirms each filter's default (0.0) is a true
+    no-op reproducing prior behavior, and that a deliberately extreme test-only
+    value actually excludes what the default would have found - not tuning a real
+    threshold, just proving the wiring works."""
+
+    def test_min_ob_body_ratio_filters_small_candles(self):
+        df = _df_from_ohlc([
+            (100, 101, 99, 99.5),    # red, small body (0.5)
+            (99.5, 102, 99, 101.5),  # green, closes above prev high -> OB at default
+        ])
+
+        self.assertEqual(len(detect_order_blocks(df)), 1)  # default (0.0) - unfiltered
+        self.assertEqual(detect_order_blocks(df, min_ob_body_ratio=5.0), [])
+
+    def test_min_fvg_gap_ratio_filters_small_gaps(self):
+        df = _df_from_ohlc([
+            (99, 100, 98, 99.5),
+            (99.5, 100.5, 99, 100.0),
+            (100, 100.5, 100.2, 100.3),  # low=100.2 > candle_1 high=100 -> small gap
+        ])
+
+        self.assertEqual(len(detect_fvg(df)), 1)  # default (0.0) - unfiltered
+        self.assertEqual(detect_fvg(df, min_fvg_gap_ratio=5.0), [])
+
+    def test_min_break_distance_filters_small_breaks(self):
+        df = _df_from_ohlc([
+            (100, 100, 100, 100),
+            (100, 100, 100, 100),
+            (100, 100, 100, 100),
+            (100, 100, 100, 100),
+            (102, 102, 102, 102),  # close breaks the 101.0 level by 1.0
+        ])
+        swings = [{"type": "high", "price": 101.0, "index": 0, "time": None}]
+
+        # right_bars=0 so the swing is usable immediately - isolates the
+        # close-crossing distance check from swing-confirmation timing.
+        events = detect_bos_choch(df, swings, right_bars=0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["price"], 101.0)
+
+        # Distance (1.0) clears a smaller threshold - still fires.
+        self.assertEqual(len(detect_bos_choch(df, swings, right_bars=0, min_break_distance=0.5)), 1)
+        # Distance (1.0) doesn't clear a larger threshold - filtered out.
+        self.assertEqual(detect_bos_choch(df, swings, right_bars=0, min_break_distance=2.0), [])
 
 
 if __name__ == "__main__":

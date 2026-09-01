@@ -23,17 +23,58 @@ def _time_str(window: pd.DataFrame, i: int) -> str | None:
         return None
 
 
-def detect_order_blocks(window: pd.DataFrame) -> list[dict[str, Any]]:
+def _atr(window: pd.DataFrame, period: int = 14) -> pd.Series:
+    """True-range-based ATR, used only as the volatility yardstick for the
+    min_ob_body_ratio/min_fvg_gap_ratio filters below - not itself an exposed
+    feature. period=14 is the standard textbook ATR default (not an SMC-specific
+    tuning choice like the ratios that use it), so it isn't threaded through as its
+    own configurable parameter."""
+    high = window["high"].astype(float)
+    low = window["low"].astype(float)
+    prev_close = window["close"].astype(float).shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return true_range.rolling(window=period, min_periods=1).mean()
+
+
+# TODO: no order-block minimum-size filter existed before this parameter was added -
+# any 2-candle engulf qualified regardless of how small the candle was (see
+# docs/detector-logic.md's "Order block" section). 0.0 (off) reproduces that exact
+# prior behavior byte-for-byte; a real nonzero value needs its own validation pass
+# for 5-minute BTC/USD bars before being trusted - this is a placeholder for making
+# the assumption visible/configurable, not a chosen value.
+DEFAULT_MIN_OB_BODY_RATIO = 0.0
+
+
+def detect_order_blocks(
+    window: pd.DataFrame,
+    min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
+) -> list[dict[str, Any]]:
     """Order Block: a candle that gets strongly overrun (engulfed) by the next candle
-    in the opposite direction."""
+    in the opposite direction, with a body at least min_ob_body_ratio * ATR(14) -
+    a ratio rather than a raw price threshold since BTC's price scale drifts too
+    much for a fixed dollar minimum to stay meaningful (same reasoning as
+    backtest/risk.py's absolute-dollar min_sl_distance being flagged for
+    re-validation, just solved with a ratio here instead). Still no BOS/CHoCH gating
+    or mitigation tracking - see docs/detector-logic.md for why that's a separate,
+    unaddressed gap from this size filter."""
     ob_list: list[dict[str, Any]] = []
     if len(window) < 2:
         return ob_list
+
+    atr = _atr(window)
 
     for i in range(1, len(window)):
         prev = window.iloc[i - 1]
         curr = window.iloc[i]
         ts = _time_str(window, i)
+
+        prev_body = abs(float(prev["close"]) - float(prev["open"]))
+        if prev_body < min_ob_body_ratio * float(atr.iloc[i - 1]):
+            continue  # candle too small relative to recent volatility to count as an OB
 
         if float(prev["close"]) < float(prev["open"]) and float(curr["close"]) > float(curr["open"]):
             if float(curr["close"]) > float(prev["high"]):
@@ -51,27 +92,52 @@ def detect_order_blocks(window: pd.DataFrame) -> list[dict[str, Any]]:
     return ob_list
 
 
-def detect_fvg(window: pd.DataFrame) -> list[dict[str, Any]]:
-    """Fair Value Gap: a 3-candle price gap where the middle candle's range is skipped."""
+# TODO: no FVG minimum-gap filter existed before this parameter was added - any
+# nonzero gap qualified regardless of size (see docs/detector-logic.md's "FVG"
+# section). 0.0 (off) reproduces that exact prior behavior byte-for-byte; a real
+# nonzero value needs its own validation pass for 5-minute BTC/USD bars before
+# being trusted - this is a placeholder for making the assumption visible/
+# configurable, not a chosen value.
+DEFAULT_MIN_FVG_GAP_RATIO = 0.0
+
+
+def detect_fvg(
+    window: pd.DataFrame,
+    min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
+) -> list[dict[str, Any]]:
+    """Fair Value Gap: a 3-candle price gap where the middle candle's range is
+    skipped, with a gap at least min_fvg_gap_ratio * ATR(14) - a ratio for the same
+    reason as detect_order_blocks' min_ob_body_ratio (BTC's price scale drifts too
+    much for a fixed dollar minimum to stay meaningful). The ATR reference point is
+    candle_1's position (i-2), not candle_3's - deliberately excludes the
+    gap-forming candles themselves from the volatility baseline used to judge
+    whether the gap they form is significant."""
     fvg_list: list[dict[str, Any]] = []
     if len(window) < 3:
         return fvg_list
+
+    atr = _atr(window)
 
     for i in range(2, len(window)):
         candle_1 = window.iloc[i - 2]
         candle_3 = window.iloc[i]
         ts = _time_str(window, i)
+        min_gap = min_fvg_gap_ratio * float(atr.iloc[i - 2])
 
         if float(candle_3["low"]) > float(candle_1["high"]):
-            fvg_list.append({
-                "type": "bullish", "top": float(candle_3["low"]), "bottom": float(candle_1["high"]),
-                "index": i, "time": ts,
-            })
+            gap = float(candle_3["low"]) - float(candle_1["high"])
+            if gap >= min_gap:
+                fvg_list.append({
+                    "type": "bullish", "top": float(candle_3["low"]), "bottom": float(candle_1["high"]),
+                    "index": i, "time": ts,
+                })
         elif float(candle_3["high"]) < float(candle_1["low"]):
-            fvg_list.append({
-                "type": "bearish", "top": float(candle_1["low"]), "bottom": float(candle_3["high"]),
-                "index": i, "time": ts,
-            })
+            gap = float(candle_1["low"]) - float(candle_3["high"])
+            if gap >= min_gap:
+                fvg_list.append({
+                    "type": "bearish", "top": float(candle_1["low"]), "bottom": float(candle_3["high"]),
+                    "index": i, "time": ts,
+                })
 
     return fvg_list
 
@@ -136,19 +202,39 @@ def classify_swing_trend(lows: list[dict[str, Any]], highs: list[dict[str, Any]]
     return "RANGING"
 
 
+# TODO: no minimum break-distance filter existed before this parameter was added -
+# any close beyond the level by any amount, even a single tick, counted as a break
+# (see docs/detector-logic.md's "BOS / CHoCH" section). 0.0 (off) reproduces that
+# exact prior behavior byte-for-byte; a real nonzero value needs its own validation
+# pass for 5-minute BTC/USD bars before being trusted - this is a placeholder for
+# making the assumption visible/configurable, not a chosen value. Unlike the OB/FVG
+# filters above, this is a raw price distance, not an ATR ratio - that's what was
+# asked for; nothing stops a future pass from switching it to a ratio too.
+DEFAULT_MIN_BREAK_DISTANCE = 0.0
+
+
 def detect_bos_choch(
     window: pd.DataFrame,
     swings: list[dict[str, Any]],
     right_bars: int = 3,
+    min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
 ) -> list[dict[str, Any]]:
     """BOS (Break of Structure, trend continuation) / CHoCH (Change of Character,
     trend reversal). Treats the prior swing high/low as a "structure level" and fires
-    an event the moment close crosses it:
+    an event the moment close crosses it by at least min_break_distance:
       - Bullish structure, close breaks above prior swing high -> BOS (bullish continues)
       - Bullish structure, close breaks below prior swing low  -> CHoCH (turns bearish)
       - Bearish structure, close breaks below prior swing low  -> BOS (bearish continues)
       - Bearish structure, close breaks above prior swing high -> CHoCH (turns bullish)
     A broken level is consumed; the next check only uses swings confirmed after it.
+
+    min_break_distance applies only to this close-crossing check, not to the
+    wick-based swing-supersession check below (see the "Bug fix" paragraph) - that
+    mechanism fires on a *new swing* already being past the old level, which is a
+    different kind of break (confirmed by wick, not by this bar's close) and wasn't
+    part of what this parameter was asked to gate. A nonzero min_break_distance can
+    therefore still be circumvented via that path - a documented scoping choice, not
+    an oversight.
 
     Look-ahead bias guard: a swing at index i isn't confirmed until i+right_bars (see
     detect_swings) - levels are only "known" from that point on.
@@ -198,7 +284,7 @@ def detect_bos_choch(
         close = float(window.iloc[i]["close"])
         ts = _time_str(window, i)
 
-        if pending_high is not None and close > pending_high["price"]:
+        if pending_high is not None and close > pending_high["price"] + min_break_distance:
             event_type = "BOS" if bias == "bullish" else "CHoCH"
             events.append({
                 "type": event_type, "direction": "bullish", "price": pending_high["price"],
@@ -206,7 +292,7 @@ def detect_bos_choch(
             })
             bias = "bullish"
             pending_high = None
-        elif pending_low is not None and close < pending_low["price"]:
+        elif pending_low is not None and close < pending_low["price"] - min_break_distance:
             event_type = "BOS" if bias == "bearish" else "CHoCH"
             events.append({
                 "type": event_type, "direction": "bearish", "price": pending_low["price"],
@@ -256,6 +342,9 @@ def compute_smc_features(
     lookback_bars: int = DEFAULT_LOOKBACK_BARS,
     swing_left_bars: int = 3,
     swing_right_bars: int = 3,
+    min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
+    min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
+    min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
 ) -> dict[str, Any]:
     """OHLCV DataFrame -> SMC structure feature dict. Pure computation, no
     buy/sell judgment (see signals/smc_aggregator.py for that)."""
@@ -270,13 +359,15 @@ def compute_smc_features(
 
     window = df.tail(lookback_bars)
 
-    order_blocks = detect_order_blocks(window)
-    fvgs = detect_fvg(window)
+    order_blocks = detect_order_blocks(window, min_ob_body_ratio=min_ob_body_ratio)
+    fvgs = detect_fvg(window, min_fvg_gap_ratio=min_fvg_gap_ratio)
     swings = detect_swings(window, left_bars=swing_left_bars, right_bars=swing_right_bars)
     lows = [s for s in swings if s["type"] == "low"]
     highs = [s for s in swings if s["type"] == "high"]
     swing_trend = classify_swing_trend(lows, highs)
-    structure_events = detect_bos_choch(window, swings, right_bars=swing_right_bars)
+    structure_events = detect_bos_choch(
+        window, swings, right_bars=swing_right_bars, min_break_distance=min_break_distance,
+    )
     fakeout = detect_fakeout(window, swings)
 
     return {
