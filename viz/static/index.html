@@ -86,7 +86,7 @@
       <div class="spacer"></div>
       <div class="conn-indicator"><span id="connDot" class="status-dot"></span><span id="connLabel" class="conn-label">not connected</span></div>
     </div>
-    <div class="notice">Paper trading isn't wired to Kraken's live WS feed yet (next session's scope) - starting it will report that plainly instead of pretending to run.</div>
+    <div class="notice">Streams Kraken's live public WS feed through the same fee/slippage-aware fill simulator backtest uses (backtest/runner.py::FillEngine). min_confluence/initial balance/fee/slippage default the same as the last backtest run - see viz/control.py to change them.</div>
   </div>
 
   <!-- LIVE PANEL -->

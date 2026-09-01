@@ -4,16 +4,15 @@ Start/stop/status for all three run modes (backtest, paper, live), sitting in fr
 of backtest/runner.py and live/trader.py. The dashboard is not read-only - this is
 what its Backtest/Paper/Live controls actually call.
 
-Today's scope (see the kickoff task order): backtest runs fully against pinned
-snapshot data. Paper trading's start/stop/status plumbing is real, but wiring it to
-Kraken's live WS feed is next session's work (viz/kraken_ws.py exists and is tested
-standalone, just not hooked up here yet) - starting paper trading today raises
-NotImplementedError rather than pretending to run. Live trading is permanently
-refused here until live/trader.kill_switch_ready() is True, independent of whatever
-the UI shows - see that function's docstring for what has to land first.
+Backtest runs fully against pinned snapshot data. Paper trading streams Kraken's
+live public WS feed (viz/kraken_ws.py) through the same FillEngine backtest uses -
+one simulation engine, two data sources, per the original architecture decision.
+Live trading is permanently refused here until live/trader.kill_switch_ready() is
+True, independent of whatever the UI shows - see that function's docstring for what
+has to land first.
 """
+import asyncio
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,10 +21,11 @@ from typing import Any, Callable, Literal
 import pandas as pd
 
 from backtest.risk import RiskManager
-from backtest.runner import FillConfig, run_backtest
+from backtest.runner import FillConfig, FillEngine, Position, run_backtest
 from data.snapshot import load_snapshot
 from live.trader import kill_switch_ready
 from signals.smc_aggregator import SMCSignalAggregator
+from viz.kraken_ws import stream_ohlc
 
 BroadcastFn = Callable[[dict[str, Any]], None]
 
@@ -58,6 +58,12 @@ class ControlPanel:
         self._broadcast = broadcast
         self.backtest = BacktestState()
         self.paper = PaperState()
+
+        self._paper_task: asyncio.Task | None = None
+        self._paper_stop_event: asyncio.Event | None = None
+        self._paper_engine: FillEngine | None = None
+        self._paper_current_interval_ts: pd.Timestamp | None = None
+        self._paper_last_candle: dict[str, Any] | None = None
 
     # ---- Backtest -------------------------------------------------------------
 
@@ -139,21 +145,101 @@ class ControlPanel:
             self._broadcast({"type": "backtest_error", "run_id": run_id, "message": str(e)})
 
     # ---- Paper trading ----------------------------------------------------------
+    #
+    # Kraken's WS OHLC channel has no "candle closed" flag - it repeats "update"
+    # messages for the same interval_begin as a bar forms, then moves on to a new
+    # interval_begin once it closes. _on_paper_candle() detects that transition and
+    # feeds FillEngine the *final* value seen for the bar that just closed, not
+    # every partial update (feeding partial closes would mean the signal/fill logic
+    # sees a different "close" price every few seconds - the same look-ahead-bias
+    # problem the backtest side is careful to avoid). A reconnect (viz/kraken_ws.py)
+    # replays a snapshot burst that can include the bar already closed just before
+    # the drop - that one is recognized by its interval_begin being strictly older
+    # than what's already been processed and is skipped, not re-fed. A replayed
+    # interval_begin equal to the bar currently being tracked is different: that bar
+    # hasn't closed yet, so the replay is legitimate fresher data for it, not a
+    # stale duplicate - it's treated as just another in-progress update.
 
-    def start_paper(self) -> None:
+    def start_paper(
+        self,
+        min_confluence: int,
+        initial_balance: float,
+        taker_fee_pct: float,
+        slippage_bps: float,
+        symbol: str = "BTC/USD",
+        interval_minutes: int = 5,
+    ) -> None:
         if self.paper.status == "running":
             raise RuntimeError("Paper trading is already running.")
-        # TODO(next session): wire viz/kraken_ws.stream_ohlc into a FillEngine here.
-        # Deliberately not faked - starting paper trading today should fail loudly,
-        # not silently do nothing while the UI claims it's running.
-        raise NotImplementedError(
-            "Paper trading isn't wired to the live Kraken feed yet - "
-            "see viz/control.py's ControlPanel.start_paper TODO."
+
+        aggregator = SMCSignalAggregator(min_confluence=min_confluence)
+        risk = RiskManager(initial_balance=initial_balance)
+        fill_config = FillConfig(taker_fee_pct=taker_fee_pct, slippage_bps=slippage_bps)
+
+        self._paper_engine = FillEngine(aggregator, risk, fill_config)
+        self._paper_stop_event = asyncio.Event()
+        self._paper_current_interval_ts = None
+        self._paper_last_candle = None
+
+        self.paper = PaperState(status="running", balance=initial_balance, open_position=None, connection="reconnecting")
+        self._broadcast({"type": "paper_status"})
+
+        self._paper_task = asyncio.create_task(stream_ohlc(
+            symbol, interval_minutes, self._on_paper_candle,
+            on_state=self._on_paper_connection_state, stop_event=self._paper_stop_event,
+        ))
+
+    async def stop_paper(self) -> None:
+        if self.paper.status != "running":
+            return
+        if self._paper_stop_event is not None:
+            self._paper_stop_event.set()
+        if self._paper_task is not None:
+            await self._paper_task
+        self.paper.status = "stopped"
+        self.paper.connection = "dropped"
+        self._broadcast({"type": "paper_status"})
+
+    def _on_paper_connection_state(self, state: str, info: dict[str, Any]) -> None:
+        self.paper.connection = state  # type: ignore[assignment]
+        self._broadcast({"type": "paper_status"})
+
+    def _on_paper_candle(self, candle: dict[str, Any]) -> None:
+        interval_begin = candle.get("interval_begin")
+        ts = pd.Timestamp(interval_begin)
+
+        if self._paper_current_interval_ts is None:
+            self._paper_current_interval_ts = ts
+            self._paper_last_candle = candle
+            return
+
+        if ts < self._paper_current_interval_ts:
+            return  # a post-reconnect snapshot replaying an already-closed bar
+
+        if ts == self._paper_current_interval_ts:
+            self._paper_last_candle = candle  # still the same forming bar
+            return
+
+        closed_candle = self._paper_last_candle
+        self._paper_current_interval_ts = ts
+        self._paper_last_candle = candle
+        self._feed_closed_paper_candle(closed_candle)
+
+    def _feed_closed_paper_candle(self, candle: dict[str, Any]) -> None:
+        engine = self._paper_engine
+        if engine is None:
+            return
+
+        event = engine.on_candle(
+            pd.Timestamp(candle["interval_begin"]),
+            float(candle["open"]), float(candle["high"]), float(candle["low"]), float(candle["close"]),
         )
 
-    def stop_paper(self) -> None:
-        self.paper.status = "stopped"
-        self._broadcast({"type": "paper_status", "status": "stopped"})
+        self.paper.balance = engine.risk.current_balance
+        self.paper.open_position = _position_to_dict(engine.position)
+        self._broadcast({"type": "paper_status"})
+        if event:
+            self._broadcast({"type": "paper_trade", **event})
 
     # ---- Live trading -------------------------------------------------------------
 
@@ -179,3 +265,13 @@ class ControlPanel:
 
 def _iso(t: Any) -> str:
     return t.isoformat() if hasattr(t, "isoformat") else str(t)
+
+
+def _position_to_dict(position: Position | None) -> dict[str, Any] | None:
+    if position is None:
+        return None
+    return {
+        "side": position.side, "entry_price": position.entry_price,
+        "stop_loss": position.stop_loss, "take_profit": position.take_profit,
+        "size": position.size,
+    }

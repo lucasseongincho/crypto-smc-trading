@@ -134,20 +134,25 @@ def api_backtest_status() -> dict[str, Any]:
     return {"status": b.status, "run_id": b.run_id, "progress": b.progress, "error": b.error}
 
 
+class PaperStartRequest(BaseModel):
+    min_confluence: int = 2
+    initial_balance: float = 20_000.0
+    taker_fee_pct: float = 0.0040
+    slippage_bps: float = 5.0
+
+
 @app.post("/api/paper/start")
-def api_paper_start() -> dict[str, str]:
+async def api_paper_start(req: PaperStartRequest) -> dict[str, str]:
     try:
-        control.start_paper()
+        control.start_paper(req.min_confluence, req.initial_balance, req.taker_fee_pct, req.slippage_bps)
         return {"status": "running"}
-    except NotImplementedError as e:
-        return {"error": str(e)}
     except RuntimeError as e:
         return {"error": str(e)}
 
 
 @app.post("/api/paper/stop")
-def api_paper_stop() -> dict[str, str]:
-    control.stop_paper()
+async def api_paper_stop() -> dict[str, str]:
+    await control.stop_paper()
     return {"status": "stopped"}
 
 

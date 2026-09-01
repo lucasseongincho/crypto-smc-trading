@@ -409,10 +409,21 @@ function renderTradeLog(trades) {
 
 // ---- Paper / Live -----------------------------------------------------------------
 
+const CONNECTION_COLORS = { healthy: "#3ecf8e", reconnecting: "#d99a2b", dropped: "#565d66" };
+
 async function setupPaper() {
   document.getElementById("paperToggleBtn").addEventListener("click", async () => {
-    const result = await api("/api/paper/start", { method: "POST" });
-    if (result.error) showError(result.error);
+    const status = await api("/api/paper/status");
+    if (status.status === "running") {
+      await api("/api/paper/stop", { method: "POST" });
+    } else {
+      const result = await api("/api/paper/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (result.error) showError(result.error);
+    }
     refreshPaperStatus();
   });
   refreshPaperStatus();
@@ -422,9 +433,15 @@ async function refreshPaperStatus() {
   const s = await api("/api/paper/status");
   document.getElementById("statusPaper").textContent = s.status;
   document.getElementById("paperBalance").textContent = s.balance !== null ? fmtUsd(s.balance) : "$--";
-  document.getElementById("paperPosition").textContent = s.open_position ? JSON.stringify(s.open_position) : "flat";
+  document.getElementById("paperPosition").textContent = s.open_position
+    ? `${s.open_position.side} ${s.open_position.size.toFixed(5)} @ ${s.open_position.entry_price.toFixed(1)}`
+    : "flat";
   document.getElementById("connLabel").textContent = s.connection;
+  document.getElementById("connDot").style.background = CONNECTION_COLORS[s.connection] || "#565d66";
   document.getElementById("dotPaper").style.background = s.status === "running" ? "#d99a2b" : "#565d66";
+
+  const btn = document.getElementById("paperToggleBtn");
+  btn.textContent = s.status === "running" ? "STOP PAPER TRADING" : "START PAPER TRADING";
 }
 
 async function setupLive() {
@@ -450,6 +467,7 @@ function connectWs() {
       case "backtest_done": onBacktestDone(msg); break;
       case "backtest_error": onBacktestError(msg); break;
       case "paper_status": refreshPaperStatus(); break;
+      case "paper_trade": console.log("[paper trade]", msg); break;
       default: break;
     }
   };
