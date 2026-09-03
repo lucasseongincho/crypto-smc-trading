@@ -133,7 +133,13 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
     function's docstring and backtest/runner.py's FillEngine.allow_short docstring
     for why this is diagnostic-only, never a real trading mode."""
     aggregator = SMCSignalAggregator(min_confluence=point.min_confluence)
-    risk = RiskManager(initial_balance=INITIAL_BALANCE)
+    # skip_if_capital_capped=True is fixed here, not a swept grid parameter -
+    # it's an established fix (backtest/risk.py, commit 2a396ab; re-verified
+    # compatible with the post-rebuild detector/aggregator code via a live
+    # smoke test), not an open question this grid is meant to explore. Sweeping
+    # it would mean half the grid re-measures a known-worse (forced-sizing)
+    # baseline instead of spending that compute on genuinely unknown parameters.
+    risk = RiskManager(initial_balance=INITIAL_BALANCE, skip_if_capital_capped=True)
     result = run_backtest(
         df, aggregator, risk, FillConfig(),
         min_ob_body_ratio=point.min_ob_body_ratio,
