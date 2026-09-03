@@ -18,6 +18,18 @@
   --red: #e0483d;
   --red-bg: #1d1113;
   --red-border: #5c2621;
+  /* Detector chip colors (2026-09 rebuild Phase 6) - one representative color
+     per detector, used for the overlay toggle swatches and the new trendline/
+     channel/fakeout-trap renderers. Purple (order block) and blue (FVG, same
+     as --accent) carried over unchanged from design-reference/'s mockup;
+     orange carried from that mockup's retired "liq sweep" swatch to fakeout/
+     trap; teal and rose are new, chosen to avoid --red/--amber (reserved for
+     mode meaning elsewhere - kill switch, live danger states). */
+  --ob-chip: #a78bfa;
+  --fvg-chip: #38bdf8;
+  --trendline-chip: #2dd4bf;
+  --channel-chip: #f472b6;
+  --fakeout-trap-chip: #e07b53;
   font-family: 'IBM Plex Sans', system-ui, sans-serif;
 }
 
@@ -100,6 +112,14 @@ select { padding: 6px 6px; min-width: 220px; }
 .kill-head { display: flex; align-items: center; gap: 9px; margin-bottom: 9px; }
 .kill-reason { font-size: 12.5px; color: var(--text-dim); line-height: 1.55; }
 
+.risk-summary { margin-top: 16px; border: 1px solid var(--input-border); background: var(--sunken); }
+.risk-summary-list { padding: 4px 0; }
+.risk-row { display: flex; align-items: baseline; padding: 8px 15px; border-bottom: 1px solid var(--rule-soft); }
+.risk-row:last-child { border-bottom: none; }
+.risk-label { flex: 1; font-size: 11.5px; letter-spacing: .04em; color: var(--text-faint); }
+.risk-value { font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: var(--text); }
+.risk-value.dim { color: var(--text-ghost); font-style: italic; }
+
 /* Chart + feed */
 .chart-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--rule); }
 .chart-col { flex: 1; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--rule); }
@@ -108,10 +128,11 @@ select { padding: 6px 6px; min-width: 220px; }
 .overlay-btn { background: var(--sunken); color: var(--text-faint); border: 1px solid var(--input-border); padding: 4px 10px; font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .04em; cursor: pointer; display: flex; align-items: center; gap: 6px; }
 .overlay-btn.active { background: #1a1e24; color: var(--text-dim); border-color: var(--accent-border); }
 .swatch { display: inline-block; width: 7px; height: 7px; }
-.swatch.ob { background: var(--green); }
-.swatch.fvg { background: var(--accent); }
-.swatch.swing { background: var(--text-mute); }
-.swatch.structure { background: var(--amber); }
+.swatch.ob { background: var(--ob-chip); }
+.swatch.fvg { background: var(--fvg-chip); }
+.swatch.trendline { background: var(--trendline-chip); }
+.swatch.channel { background: var(--channel-chip); }
+.swatch.fakeout-trap { background: var(--fakeout-trap-chip); }
 .last-price { font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600; color: #e8eaed; }
 .chart-wrap { position: relative; background: var(--bg); }
 #chart { width: 100%; height: 440px; }
@@ -137,6 +158,20 @@ select { padding: 6px 6px; min-width: 220px; }
 .feed-pnl-val.pos { color: var(--green); }
 .feed-pnl-val.neg { color: var(--red); }
 .feed-r { font-size: 9.5px; letter-spacing: .06em; color: var(--text-faint); }
+.feed-row { cursor: pointer; }
+.feed-row.selected { background: var(--panel-alt); }
+
+/* Detector breakdown panel */
+.breakdown-panel { border-top: 1px solid var(--rule); }
+.breakdown-list { padding: 10px 14px; display: flex; flex-direction: column; gap: 8px; }
+.breakdown-row { display: flex; align-items: center; gap: 9px; }
+.breakdown-swatch { width: 7px; height: 7px; flex: none; }
+.breakdown-name { flex: 1; font-size: 12px; color: var(--text-dim); }
+.breakdown-vote { font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; letter-spacing: .04em; }
+.breakdown-vote.bullish { color: var(--green); }
+.breakdown-vote.bearish { color: var(--red); }
+.breakdown-vote.none { color: var(--text-ghost); font-weight: 400; }
+.breakdown-score { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--text-faint); padding: 8px 14px 0; border-top: 1px solid var(--rule-soft); margin-top: 2px; }
 
 /* Results */
 .results-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--rule); background: var(--panel); }

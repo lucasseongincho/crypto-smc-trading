@@ -5,8 +5,16 @@
 const INTERVAL_SECONDS = 5 * 60;
 const OB_EXTEND_BARS = 24;
 const FVG_EXTEND_BARS = 16;
-const STRUCTURE_HALF_WIDTH_BARS = 4;
 
+// Detector chip/render colors (2026-09 rebuild Phase 6). Purple (order block)
+// and blue (FVG) carried over unchanged from design-reference/'s mockup; orange
+// carried from that mockup's retired "liq sweep" swatch to fakeout/trap; teal
+// and rose are new, chosen to avoid red/amber (reserved for mode meaning
+// elsewhere - kill switch, live danger states). BOS/CHoCH's bos/choch colors
+// and the swing dot colors are retired along with their overlay (see
+// docs/detector-logic.md's BOS/CHoCH section for why the detector itself still
+// runs - its swing-confirmation machinery feeds trendline/channel fitting -
+// even though nothing draws it on the chart anymore).
 const COLORS = {
   obBullish: "rgba(62,207,142,0.8)",
   obBullishFill: "rgba(62,207,142,0.20)",
@@ -16,10 +24,10 @@ const COLORS = {
   fvgBullishFill: "rgba(56,189,248,0.16)",
   fvgBearish: "rgba(217,154,43,0.8)",
   fvgBearishFill: "rgba(217,154,43,0.16)",
-  swingHigh: "#a9b1ba",
-  swingLow: "#79828c",
-  bos: "#3ecf8e",
-  choch: "#e0483d",
+  trendline: "#2dd4bf",
+  channelStroke: "rgba(244,114,182,0.75)",
+  channelFill: "rgba(244,114,182,0.12)",
+  fakeoutTrap: "#e07b53",
 };
 
 // ---- State --------------------------------------------------------------------
@@ -32,9 +40,11 @@ const state = {
   ctx: null,
   candles: [],
   features: {},
-  activeLayers: new Set(["orderBlocks", "fvgs", "swings", "structure"]),
+  activeLayers: new Set(["orderBlocks", "fvgs", "trendline", "channel", "fakeoutTrap"]),
   ws: null,
   currentRunId: null,
+  trades: [],
+  selectedTradeIdx: null,
 };
 
 // ---- Helpers ------------------------------------------------------------------
@@ -77,6 +87,7 @@ function setupTabs() {
       document.getElementById("panelBacktest").classList.toggle("hidden", state.mode !== "backtest");
       document.getElementById("panelPaper").classList.toggle("hidden", state.mode !== "paper");
       document.getElementById("panelLive").classList.toggle("hidden", state.mode !== "live");
+      if (state.mode === "live") renderRiskSummary();
     });
   });
 }
@@ -161,41 +172,114 @@ function drawOverlays() {
     }
   }
 
-  if (state.activeLayers.has("swings")) {
-    for (const s of state.features.swings || []) {
-      const x = timeScale.timeToCoordinate(isoToUnix(s.time));
-      const y = state.series.priceToCoordinate(s.price);
-      if (x === null || y === null) continue;
-      ctx.beginPath();
-      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = s.type === "high" ? COLORS.swingHigh : COLORS.swingLow;
-      ctx.fill();
+  if (state.activeLayers.has("trendline")) {
+    const trendline = state.features.trendline || {};
+    if (trendline.support) drawTrendlineLine(ctx, timeScale, trendline.support, rightEdgeX);
+    if (trendline.resistance) drawTrendlineLine(ctx, timeScale, trendline.resistance, rightEdgeX);
+    for (const brk of trendline.breaks || []) {
+      drawPointMarker(ctx, timeScale, brk.time, brk.price, COLORS.trendline, brk.type);
     }
   }
 
-  if (state.activeLayers.has("structure")) {
-    for (const ev of state.features.structure_events || []) {
-      const t0 = isoToUnix(ev.time) - STRUCTURE_HALF_WIDTH_BARS * INTERVAL_SECONDS;
-      const t1 = isoToUnix(ev.time) + STRUCTURE_HALF_WIDTH_BARS * INTERVAL_SECONDS;
-      const x0 = timeScale.timeToCoordinate(t0);
-      const x1raw = timeScale.timeToCoordinate(t1);
-      const x1 = x1raw === null ? rightEdgeX : x1raw;
-      const y = state.series.priceToCoordinate(ev.price);
-      if (x0 === null || y === null) continue;
-      ctx.save();
-      ctx.setLineDash([4, 3]);
-      ctx.strokeStyle = ev.direction === "bullish" ? COLORS.bos : COLORS.choch;
-      ctx.lineWidth = 1.25;
-      ctx.beginPath();
-      ctx.moveTo(x0, y);
-      ctx.lineTo(x1, y);
-      ctx.stroke();
-      ctx.restore();
-      ctx.fillStyle = ev.direction === "bullish" ? COLORS.bos : COLORS.choch;
-      ctx.font = "10px IBM Plex Mono, monospace";
-      ctx.fillText(ev.type, x0, y - 4);
-    }
+  if (state.activeLayers.has("channel")) {
+    const channel = state.features.channel || {};
+    if (channel.ascending) drawChannelBand(ctx, timeScale, channel.ascending, rightEdgeX);
+    if (channel.descending) drawChannelBand(ctx, timeScale, channel.descending, rightEdgeX);
   }
+
+  if (state.activeLayers.has("fakeoutTrap")) {
+    const fk = (state.features.fakeout || {}).fakeout;
+    const trap = (state.features.fakeout || {}).trap;
+    if (fk) drawPointMarker(ctx, timeScale, fk.time, fk.swept_level, COLORS.fakeoutTrap, fk.type);
+    if (trap) drawPointMarker(ctx, timeScale, trap.time, trap.broken_level, COLORS.fakeoutTrap, trap.type);
+  }
+}
+
+// detect_trendline/detect_channel fit "index" against the tail lookback_bars
+// window compute_smc_features actually passed them (window = df.tail(lookback_bars)
+// in data/smc.py), NOT against the full candle array this dashboard loads for
+// charting - a loaded snapshot can be millions of rows while the fit only ever
+// saw the last ~90. slope*i+intercept is only meaningful for i in
+// [0, lookbackWindowCandles().length), mapped back to real chart time via that
+// same tail slice's own candle array, not state.candles directly.
+function lookbackWindowCandles() {
+  const n = state.features.lookback_bars;
+  if (!n || n >= state.candles.length) return state.candles;
+  return state.candles.slice(-n);
+}
+
+// A trendline (support or resistance) is price = slope * windowIndex + intercept -
+// drawn as one thin diagonal line spanning the lookback window that produced it.
+function drawTrendlineLine(ctx, timeScale, line, rightEdgeX) {
+  const window = lookbackWindowCandles();
+  const n = window.length;
+  if (n < 2) return;
+  const x0 = timeScale.timeToCoordinate(window[0].time);
+  const x1raw = timeScale.timeToCoordinate(window[n - 1].time);
+  const x1 = x1raw === null ? rightEdgeX : x1raw;
+  const y0 = state.series.priceToCoordinate(line.slope * 0 + line.intercept);
+  const y1 = state.series.priceToCoordinate(line.slope * (n - 1) + line.intercept);
+  if (x0 === null || y0 === null || y1 === null) return;
+  ctx.save();
+  ctx.strokeStyle = COLORS.trendline;
+  ctx.lineWidth = 1.25;
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Two parallel lines (same slope, lower/upper intercepts) with a low-opacity
+// shaded region between them - same "boundary + shaded fill" idiom as the
+// existing FVG box rendering, just diagonal instead of axis-aligned.
+function drawChannelBand(ctx, timeScale, channel, rightEdgeX) {
+  const window = lookbackWindowCandles();
+  const n = window.length;
+  if (n < 2) return;
+  const x0 = timeScale.timeToCoordinate(window[0].time);
+  const x1raw = timeScale.timeToCoordinate(window[n - 1].time);
+  const x1 = x1raw === null ? rightEdgeX : x1raw;
+  const lowerAt = (i) => channel.slope * i + channel.lower.intercept;
+  const upperAt = (i) => channel.slope * i + channel.upper.intercept;
+  const y0Lower = state.series.priceToCoordinate(lowerAt(0));
+  const y1Lower = state.series.priceToCoordinate(lowerAt(n - 1));
+  const y0Upper = state.series.priceToCoordinate(upperAt(0));
+  const y1Upper = state.series.priceToCoordinate(upperAt(n - 1));
+  if ([x0, y0Lower, y1Lower, y0Upper, y1Upper].some((v) => v === null)) return;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(x0, y0Upper);
+  ctx.lineTo(x1, y1Upper);
+  ctx.lineTo(x1, y1Lower);
+  ctx.lineTo(x0, y0Lower);
+  ctx.closePath();
+  ctx.fillStyle = COLORS.channelFill;
+  ctx.fill();
+  ctx.strokeStyle = COLORS.channelStroke;
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(x0, y0Upper); ctx.lineTo(x1, y1Upper); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x0, y0Lower); ctx.lineTo(x1, y1Lower); ctx.stroke();
+  ctx.restore();
+}
+
+// Shared point-marker renderer for trendline breaks and fakeout/trap events -
+// a small filled diamond plus a text label, at one (time, price) point.
+function drawPointMarker(ctx, timeScale, iso, price, color, label) {
+  if (!iso) return;
+  const x = timeScale.timeToCoordinate(isoToUnix(iso));
+  const y = state.series.priceToCoordinate(price);
+  if (x === null || y === null) return;
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 4); ctx.lineTo(x + 4, y); ctx.lineTo(x, y + 4); ctx.lineTo(x - 4, y);
+  ctx.closePath();
+  ctx.fill();
+  ctx.font = "10px IBM Plex Mono, monospace";
+  ctx.fillText(label, x + 6, y - 4);
+  ctx.restore();
 }
 
 function drawBox(ctx, timeScale, t0, t1, priceLow, priceHigh, rightEdgeX, strokeColor, fillColor) {
@@ -378,16 +462,22 @@ function renderEquityCurve(equity, buyHold) {
 }
 
 function renderTradeLog(trades) {
+  state.trades = trades;
+  state.selectedTradeIdx = trades.length ? trades.length - 1 : null; // most recent, by default
+
   const list = document.getElementById("feedList");
   document.getElementById("feedMeta").textContent = `${trades.length} trades`;
   if (!trades.length) {
     list.innerHTML = '<div class="feed-empty">No trades in this run.</div>';
+    renderBreakdown(null);
     return;
   }
   list.innerHTML = "";
-  for (const t of trades.slice().reverse()) {
+  for (let i = trades.length - 1; i >= 0; i--) {
+    const t = trades[i];
     const row = document.createElement("div");
-    row.className = "feed-row";
+    row.className = "feed-row" + (i === state.selectedTradeIdx ? " selected" : "");
+    row.dataset.idx = i;
     const sideClass = t.side === "BUY" ? "buy" : "sell";
     const pnlClass = t.pnl >= 0 ? "pos" : "neg";
     row.innerHTML = `
@@ -403,6 +493,53 @@ function renderTradeLog(trades) {
         <span class="feed-pnl-val ${pnlClass}">${fmtUsd(t.pnl)}</span>
         <span class="feed-r">${t.r_multiple.toFixed(2)}R</span>
       </div>`;
+    row.addEventListener("click", () => selectTrade(i));
+    list.appendChild(row);
+  }
+  renderBreakdown(trades[state.selectedTradeIdx]);
+}
+
+function selectTrade(idx) {
+  state.selectedTradeIdx = idx;
+  for (const row of document.querySelectorAll("#feedList .feed-row")) {
+    row.classList.toggle("selected", Number(row.dataset.idx) === idx);
+  }
+  renderBreakdown(state.trades[idx]);
+}
+
+// Detector breakdown panel (2026-09 rebuild Phase 6) - the 5-vote breakdown for
+// whichever trade is selected in the log above (most recent by default), read
+// straight from SMCSignal.contributing_factors as carried onto Trade
+// (backtest/runner.py) and serialized by viz/control.py.
+const DETECTOR_LABELS = [
+  ["order_block", "Order Block", "ob"],
+  ["fvg", "FVG", "fvg"],
+  ["trendline", "Trendline", "trendline"],
+  ["channel", "Channel", "channel"],
+  ["fakeout_trap", "Fakeout/Trap", "fakeout-trap"],
+];
+
+function renderBreakdown(trade) {
+  const list = document.getElementById("breakdownList");
+  const meta = document.getElementById("breakdownMeta");
+  if (!trade) {
+    meta.textContent = "--";
+    list.innerHTML = '<div class="feed-empty">Click a trade in the log above to see its 5-vote breakdown.</div>';
+    return;
+  }
+  const factors = trade.contributing_factors || {};
+  meta.textContent = `conf ${trade.confluence >= 0 ? "+" : ""}${trade.confluence}`;
+  list.innerHTML = "";
+  for (const [key, label, swatchClass] of DETECTOR_LABELS) {
+    const vote = factors[key] ?? null;
+    const voteClass = vote === "bullish" ? "bullish" : vote === "bearish" ? "bearish" : "none";
+    const voteText = vote === "bullish" ? "BULLISH" : vote === "bearish" ? "BEARISH" : "—";
+    const row = document.createElement("div");
+    row.className = "breakdown-row";
+    row.innerHTML = `
+      <span class="breakdown-swatch swatch ${swatchClass}"></span>
+      <span class="breakdown-name">${label}</span>
+      <span class="breakdown-vote ${voteClass}">${voteText}</span>`;
     list.appendChild(row);
   }
 }
@@ -452,6 +589,26 @@ async function setupLive() {
   btn.disabled = !readiness.kill_switch_ready;
   document.getElementById("statusLive").textContent = readiness.kill_switch_ready ? "ready" : "disabled";
   document.getElementById("dotLive").classList.toggle("red", !readiness.kill_switch_ready);
+  await renderRiskSummary();
+}
+
+async function renderRiskSummary() {
+  const s = await api("/api/live/risk-summary");
+  const rows = [
+    ["POSITION SIZE / TRADE", `${s.position_size_pct.toFixed(1)}% of balance`, false],
+    ["DAILY LOSS LIMIT", s.daily_loss_limit === null ? "not configured" : fmtUsd(s.daily_loss_limit), s.daily_loss_limit === null],
+    ["MAX DRAWDOWN AUTO-HALT", s.max_drawdown_halt_pct === null ? "not configured" : s.max_drawdown_halt_pct.toFixed(1) + "%", s.max_drawdown_halt_pct === null],
+    ["CONFLUENCE THRESHOLD", s.confluence_threshold_display, false],
+    ["BALANCE AT ARM", s.balance_at_arm === null ? "--" : fmtUsd(s.balance_at_arm), s.balance_at_arm === null],
+  ];
+  const list = document.getElementById("riskSummaryList");
+  list.innerHTML = "";
+  for (const [label, value, dim] of rows) {
+    const row = document.createElement("div");
+    row.className = "risk-row";
+    row.innerHTML = `<span class="risk-label">${label}</span><span class="risk-value${dim ? " dim" : ""}">${value}</span>`;
+    list.appendChild(row);
+  }
 }
 
 // ---- WebSocket ----------------------------------------------------------------------

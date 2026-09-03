@@ -118,5 +118,43 @@ class TestStateAndBroadcast(unittest.TestCase):
         self.assertTrue(any(b.get("type") == "paper_status" for b in panel.broadcasts))
 
 
+class TestRiskSummary(unittest.TestCase):
+    """viz/control.py::ControlPanel.risk_summary() - Phase 6 of the 2026-09
+    detector rebuild, ported into the live panel per the dashboard rebuild
+    decision. Confirms honest not-configured reporting for fields that aren't
+    real settings anywhere in this codebase yet (kill_switch_ready() is a
+    hardcoded stub - see live/trader.py), rather than fabricated numbers."""
+
+    def test_confluence_threshold_is_not_set_before_any_run(self):
+        panel = _make_panel()
+        summary = panel.risk_summary()
+        self.assertEqual(summary["confluence_threshold_display"], "not set - run a backtest first")
+
+    def test_confluence_threshold_reflects_the_most_recent_backtest_start(self):
+        panel = _make_panel()
+        panel._last_min_confluence = 3
+        summary = panel.risk_summary()
+        self.assertEqual(summary["confluence_threshold_display"], "3 of 5")
+
+    def test_daily_loss_limit_and_drawdown_halt_are_honestly_not_configured(self):
+        panel = _make_panel()
+        summary = panel.risk_summary()
+        self.assertIsNone(summary["daily_loss_limit"])
+        self.assertIsNone(summary["max_drawdown_halt_pct"])
+
+    def test_balance_at_arm_is_none_while_the_kill_switch_is_not_ready(self):
+        # kill_switch_ready() is a hardcoded False stub today - risk_summary()
+        # must not attempt a real Kraken balance call in that state.
+        panel = _make_panel()
+        summary = panel.risk_summary()
+        self.assertIsNone(summary["balance_at_arm"])
+
+    def test_position_size_pct_reflects_riskmanagers_own_default(self):
+        from backtest.risk import RiskManager
+        panel = _make_panel()
+        summary = panel.risk_summary()
+        self.assertAlmostEqual(summary["position_size_pct"], RiskManager().risk_pct * 100)
+
+
 if __name__ == "__main__":
     unittest.main()

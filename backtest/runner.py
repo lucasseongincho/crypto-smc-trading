@@ -51,6 +51,12 @@ class Position:
     entry_time: Any
     entry_fee: float
     confluence: int
+    # The SMCSignal.contributing_factors dict at entry (2026-09 rebuild Phase 6) -
+    # {"order_block"/"fvg"/"trendline"/"channel"/"fakeout_trap": "bullish"|
+    # "bearish"|None}, see signals/smc_aggregator.py. Carried through to Trade so
+    # the dashboard's detector breakdown panel can show which of the 5 votes
+    # actually fired for a given trade, not just the net confluence score.
+    contributing_factors: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -65,6 +71,7 @@ class Trade:
     r_multiple: float
     confluence: int
     exit_reason: str  # "TP" | "SL"
+    contributing_factors: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -268,6 +275,7 @@ class FillEngine:
         self.position = Position(
             side=side, entry_price=entry_price, stop_loss=stop_loss, take_profit=take_profit,
             size=size, entry_time=time, entry_fee=entry_fee, confluence=signal.confluence_score,
+            contributing_factors=dict(signal.contributing_factors),
         )
         return {
             "type": "entry", "side": side, "entry_price": entry_price,
@@ -313,6 +321,7 @@ class FillEngine:
             side=pos.side, entry_time=pos.entry_time, exit_time=time,
             entry_price=pos.entry_price, exit_price=exit_price, size=pos.size,
             pnl=pnl, r_multiple=r_multiple, confluence=pos.confluence, exit_reason=reason,
+            contributing_factors=pos.contributing_factors,
         )
         self.trades.append(trade)
         self.equity_curve.append({"time": _iso(time), "balance": self.risk.current_balance})

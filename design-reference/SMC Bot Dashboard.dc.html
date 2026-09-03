@@ -396,13 +396,21 @@
 </x-dc>
 <script type="text/x-dc" data-dc-script data-props="{&quot;initialMode&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;backtest&quot;,&quot;paper&quot;,&quot;live&quot;],&quot;default&quot;:&quot;backtest&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;State&quot;},&quot;killSwitchReady&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:false,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;State&quot;},&quot;paperConnection&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;healthy&quot;,&quot;reconnecting&quot;,&quot;dropped&quot;],&quot;default&quot;:&quot;healthy&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;State&quot;},&quot;chartHeight&quot;:{&quot;editor&quot;:&quot;int&quot;,&quot;default&quot;:440,&quot;min&quot;:320,&quot;max&quot;:700,&quot;unit&quot;:&quot;px&quot;,&quot;tsType&quot;:&quot;number&quot;,&quot;section&quot;:&quot;Layout&quot;}}">
 const RULE = '#23272e';
+// 2026-09 detector rebuild, Phase 6: updated from the old 4-chip/veto model to
+// the real 5-detector model actually implemented in viz/static/ - BOS/CHoCH is
+// removed entirely (chip, overlay, color - see docs/detector-logic.md), swing
+// is replaced by a real trendline detector, and a new channel detector is
+// added. 'sweep' (LIQ SWEEP, orange #e07b53) is renamed/relabeled to
+// 'fakeoutTrap' (FAKEOUT/TRAP) - same orange, carried forward, not a new color.
+// ob (purple) and fvg (blue) are unchanged.
 const OVERLAY_DEFS = [
   { key: 'ob', label: 'ORDER BLOCK', color: '#a78bfa' },
   { key: 'fvg', label: 'FVG', color: '#38bdf8' },
-  { key: 'sweep', label: 'LIQ SWEEP', color: '#e07b53' },
-  { key: 'bos', label: 'BOS / CHoCH', color: '#4ade80' }
+  { key: 'trendline', label: 'TRENDLINE', color: '#2dd4bf' },
+  { key: 'channel', label: 'CHANNEL', color: '#f472b6' },
+  { key: 'fakeoutTrap', label: 'FAKEOUT/TRAP', color: '#e07b53' }
 ];
-const DET_NAMES = ['ORDER BLOCK', 'FVG', 'SWING', 'BOS/CHoCH', 'FAKEOUT'];
+const DET_NAMES = ['ORDER BLOCK', 'FVG', 'TRENDLINE', 'CHANNEL', 'FAKEOUT/TRAP'];
 
 function rng(seed) {
   let s = seed;
@@ -454,7 +462,7 @@ class Component extends DCLogic {
       running: false, progress: 0, hasResults: true, elapsedMs: 0,
       replayIdx: 320, playing: false, speed: 4,
       expanded: {}, selected: null,
-      overlays: { ob: true, fvg: true, sweep: true, bos: true },
+      overlays: { ob: true, fvg: true, trendline: true, channel: true, fakeoutTrap: true },
       paperRunning: true, liveArmed: false, liveRunning: false,
       killReady: !!props.killSwitchReady, tick: 0
     };
@@ -472,8 +480,8 @@ class Component extends DCLogic {
     push('fvg', 96, 128, at(94).high, at(97).low, 'bull');
     push('fvg', 198, 236, at(196).low, at(199).high, 'bear');
     push('fvg', 276, 312, at(274).high, at(277).low, 'bull');
-    push('sweep', 60, 70, at(64).low - 90, at(64).low, 'bull');
-    push('sweep', 186, 196, at(190).high, at(190).high + 90, 'bear');
+    push('fakeoutTrap', 60, 70, at(64).low - 90, at(64).low, 'bull');
+    push('fakeoutTrap', 186, 196, at(190).high, at(190).high + 90, 'bear');
     return z;
   }
 
@@ -491,7 +499,7 @@ class Component extends DCLogic {
       return {
         id: 's' + n, idx: i, time: c.time, price: c.close, dir: dir, score: score,
         dets: dets, becameTrade: score >= 3,
-        trigger: ['OB retest', 'FVG fill', 'CHoCH confirm', 'sweep reclaim', 'BOS continuation'][n % 5],
+        trigger: ['OB retest', 'FVG fill', 'trendline break', 'fakeout reclaim', 'channel break'][n % 5],
         detail: 'ATR ' + (40 + Math.round(r() * 60)) + ' · risk 1.0R · stop ' + (c.close - (dir === 'LONG' ? 210 : -210)).toFixed(1)
       };
     });
@@ -578,18 +586,12 @@ class Component extends DCLogic {
     if (this._lastMode !== st.mode || this._lastLen == null || data.length !== this._lastLen) fit = true;
     this._lastMode = st.mode; this._lastLen = data.length;
     this.series.setData(data);
+    // BOS/CHoCH chart markers removed entirely (2026-09 rebuild Phase 6) -
+    // no longer a chip, overlay, or confluence vote; see
+    // docs/detector-logic.md's BOS/CHoCH section for why the detector itself
+    // still runs (its swing-confirmation machinery feeds trendline/channel
+    // fitting) even though nothing draws it on the chart anymore.
     const marks = [];
-    if (st.overlays.bos) {
-      [[70, 'CHoCH', 'bull'], [124, 'BOS', 'bull'], [188, 'CHoCH', 'bear'], [246, 'BOS', 'bear'], [296, 'CHoCH', 'bull']].forEach((m) => {
-        if (m[0] < data.length) marks.push({
-          time: this.candles[m[0]].time,
-          position: m[2] === 'bull' ? 'belowBar' : 'aboveBar',
-          color: m[2] === 'bull' ? '#4ade80' : '#f472b6',
-          shape: m[2] === 'bull' ? 'arrowUp' : 'arrowDown',
-          text: m[1]
-        });
-      });
-    }
     const sel = st.selected;
     if (sel) {
       const s = this.allSignals.find((x) => x.id === sel);
@@ -627,7 +629,7 @@ class Component extends DCLogic {
       ctx.fillRect(x1, y1, Math.max(x2 - x1, 3), Math.max(y2 - y1, 2));
       ctx.strokeStyle = col + '99';
       ctx.lineWidth = 1;
-      ctx.setLineDash(z.type === 'sweep' ? [4, 3] : []);
+      ctx.setLineDash(z.type === 'fakeoutTrap' ? [4, 3] : []);
       ctx.strokeRect(x1 + 0.5, y1 + 0.5, Math.max(x2 - x1, 3), Math.max(y2 - y1, 2));
       ctx.setLineDash([]);
       if (x2 - x1 > 54) {

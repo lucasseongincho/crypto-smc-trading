@@ -23,7 +23,7 @@ import pandas as pd
 from backtest.risk import RiskManager
 from backtest.runner import FillConfig, FillEngine, Position, run_backtest
 from data.snapshot import load_snapshot
-from live.trader import kill_switch_ready
+from live.trader import get_account_balance, kill_switch_ready
 from signals.smc_aggregator import SMCSignalAggregator
 from viz.kraken_ws import stream_ohlc
 
@@ -65,6 +65,11 @@ class ControlPanel:
         self._paper_current_interval_ts: pd.Timestamp | None = None
         self._paper_last_candle: dict[str, Any] | None = None
 
+        # Set by the most recent start_backtest()/start_paper() call - read by
+        # risk_summary() below for the live panel's confluence threshold display.
+        # Not persisted across process restarts; None until a run has happened.
+        self._last_min_confluence: int | None = None
+
     # ---- Backtest -------------------------------------------------------------
 
     def start_backtest(
@@ -78,6 +83,7 @@ class ControlPanel:
         if self.backtest.status == "running":
             raise RuntimeError("A backtest is already running.")
 
+        self._last_min_confluence = min_confluence
         run_id = str(uuid.uuid4())
         self.backtest = BacktestState(status="running", run_id=run_id, progress={"candles_processed": 0})
         self._broadcast({"type": "backtest_status", "status": "running", "run_id": run_id})
@@ -128,6 +134,7 @@ class ControlPanel:
                         "r_multiple": t.r_multiple,
                         "confluence": t.confluence,
                         "exit_reason": t.exit_reason,
+                        "contributing_factors": t.contributing_factors,
                     }
                     for t in result.trades
                 ],
@@ -172,6 +179,7 @@ class ControlPanel:
         if self.paper.status == "running":
             raise RuntimeError("Paper trading is already running.")
 
+        self._last_min_confluence = min_confluence
         aggregator = SMCSignalAggregator(min_confluence=min_confluence)
         risk = RiskManager(initial_balance=initial_balance)
         fill_config = FillConfig(taker_fee_pct=taker_fee_pct, slippage_bps=slippage_bps)
@@ -261,6 +269,33 @@ class ControlPanel:
                 "See live/trader.py's docstring for what has to land first."
             )
         raise NotImplementedError("Live trading start path isn't built yet.")
+
+    def risk_summary(self) -> dict[str, Any]:
+        """Read by the dashboard's LIVE panel (2026-09 rebuild Phase 6) to show
+        position sizing / limits before Start is even clickable -
+        live/trader.py::get_account_balance's own docstring already anticipated
+        this exact use ("viz/control.py's Arm step needs it to show the risk
+        summary"). Two fields are honestly reported as not-yet-configured rather
+        than fabricated: daily loss limit and max-drawdown auto-halt aren't real
+        settings anywhere in this codebase yet - see kill_switch_ready()'s
+        docstring in live/trader.py for what's still [BEFORE-LIVE] scope."""
+        confluence_display = (
+            f"{self._last_min_confluence} of 5" if self._last_min_confluence is not None
+            else "not set - run a backtest first"
+        )
+        balance_at_arm = None
+        if kill_switch_ready():
+            try:
+                balance_at_arm = get_account_balance()
+            except Exception:  # noqa: BLE001 - a balance-fetch failure must not break the panel
+                balance_at_arm = None
+        return {
+            "position_size_pct": RiskManager().risk_pct * 100,
+            "daily_loss_limit": None,  # not implemented - see live/trader.py
+            "max_drawdown_halt_pct": None,  # not implemented - see live/trader.py
+            "confluence_threshold_display": confluence_display,
+            "balance_at_arm": balance_at_arm,
+        }
 
 
 def _iso(t: Any) -> str:

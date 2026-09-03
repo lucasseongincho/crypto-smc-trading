@@ -167,6 +167,11 @@ def api_live_readiness() -> dict[str, Any]:
     return control.live_readiness()
 
 
+@app.get("/api/live/risk-summary")
+def api_live_risk_summary() -> dict[str, Any]:
+    return control.risk_summary()
+
+
 @app.post("/api/live/start")
 def api_live_start() -> dict[str, str]:
     try:

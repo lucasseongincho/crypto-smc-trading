@@ -46,7 +46,7 @@
       </div>
       <div class="param-group">
         <span class="param-label">CONFLUENCE THRESHOLD</span>
-        <div class="param-inline"><input id="paramConfluence" type="number" value="2" min="1" max="4" style="width:48px; text-align:center" /><span class="param-suffix">of 4 detectors</span></div>
+        <div class="param-inline"><input id="paramConfluence" type="number" value="2" min="1" max="5" style="width:48px; text-align:center" /><span class="param-suffix">of 5 detectors</span></div>
       </div>
       <div class="param-group">
         <span class="param-label">INITIAL BALANCE</span>
@@ -102,6 +102,10 @@
       </div>
     </div>
     <div class="notice">The Start control above is a genuinely disabled HTML element (not just styled to look disabled) until live/trader.kill_switch_ready() returns True.</div>
+    <div class="risk-summary">
+      <div class="section-title">RISK SUMMARY</div>
+      <div id="riskSummaryList" class="risk-summary-list"></div>
+    </div>
   </div>
 
   <!-- CHART + FEED -->
@@ -110,10 +114,11 @@
       <div class="chart-toolbar">
         <span class="param-label">OVERLAYS</span>
         <div class="overlay-toggles">
-          <button class="overlay-btn active" data-layer="orderBlocks"><span class="swatch ob"></span>ORDER BLOCKS</button>
+          <button class="overlay-btn active" data-layer="orderBlocks"><span class="swatch ob"></span>ORDER BLOCK</button>
           <button class="overlay-btn active" data-layer="fvgs"><span class="swatch fvg"></span>FVG</button>
-          <button class="overlay-btn active" data-layer="swings"><span class="swatch swing"></span>SWINGS</button>
-          <button class="overlay-btn active" data-layer="structure"><span class="swatch structure"></span>BOS/CHoCH</button>
+          <button class="overlay-btn active" data-layer="trendline"><span class="swatch trendline"></span>TRENDLINE</button>
+          <button class="overlay-btn active" data-layer="channel"><span class="swatch channel"></span>CHANNEL</button>
+          <button class="overlay-btn active" data-layer="fakeoutTrap"><span class="swatch fakeout-trap"></span>FAKEOUT/TRAP</button>
         </div>
         <div class="spacer"></div>
         <span id="lastPrice" class="last-price">--</span>
@@ -127,6 +132,12 @@
       <div class="feed-head"><span class="param-label">TRADE LOG</span><span id="feedMeta" class="progress-meta">0 trades</span></div>
       <div id="feedList" class="feed-list">
         <div class="feed-empty">No trades yet - run a backtest.</div>
+      </div>
+      <div class="breakdown-panel">
+        <div class="feed-head"><span class="param-label">DETECTOR BREAKDOWN</span><span id="breakdownMeta" class="progress-meta">--</span></div>
+        <div id="breakdownList" class="breakdown-list">
+          <div class="feed-empty">Click a trade in the log above to see its 5-vote breakdown.</div>
+        </div>
       </div>
     </div>
   </div>

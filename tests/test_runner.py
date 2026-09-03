@@ -68,6 +68,57 @@ def _bearish_signal(confluence: int = -2) -> SMCSignal:
     )
 
 
+class TestContributingFactorsCarryThroughToTrade(unittest.TestCase):
+    """Phase 6 of the 2026-09 detector rebuild: the dashboard's detector
+    breakdown panel needs the actual 5-vote breakdown for a trade, not just its
+    net confluence score - Position and Trade both now carry
+    contributing_factors, copied from the SMCSignal that opened the position."""
+
+    def test_entry_and_exit_both_carry_the_signals_contributing_factors(self):
+        engine = FillEngine(
+            SMCSignalAggregator(min_confluence=1), RiskManager(initial_balance=10_000.0),
+            FillConfig(taker_fee_pct=0.0, slippage_bps=0.0),
+        )
+        engine._window.append((pd.Timestamp("2025-01-01", tz="utc"), 50_000.0, 50_100.0, 49_900.0, 50_000.0))
+        engine._window.append((pd.Timestamp("2025-01-01 00:05", tz="utc"), 50_000.0, 50_100.0, 49_900.0, 50_000.0))
+
+        factors = {
+            "order_block": "bullish", "fvg": "bullish", "trendline": None,
+            "channel": None, "fakeout_trap": "bullish",
+        }
+        signal = SMCSignal(
+            direction="BULLISH", confluence_score=3, bullish_count=3, bearish_count=0,
+            contributing_factors=factors,
+        )
+        with patch.object(engine.aggregator, "aggregate", return_value=signal):
+            engine._evaluate_signal(close=50_000.0)
+
+        entry_event = engine._enter(pd.Timestamp("2025-01-01 00:10", tz="utc"), open_price=50_000.0)
+        self.assertIsNotNone(entry_event)
+        self.assertEqual(engine.position.contributing_factors, factors)
+
+        engine._check_exit(pd.Timestamp("2025-01-01 00:15", tz="utc"), high=60_000.0, low=49_400.0)
+        self.assertEqual(len(engine.trades), 1)
+        self.assertEqual(engine.trades[0].contributing_factors, factors)
+        # It's the SMCSignal's own dict, not a shared mutable reference to it -
+        # mutating the trade's copy must not corrupt anything the signal object
+        # (or a later signal reusing the same dict shape) still holds.
+        engine.trades[0].contributing_factors["order_block"] = "bearish"
+        self.assertEqual(factors["order_block"], "bullish")
+
+    def test_default_contributing_factors_is_an_empty_dict_not_shared_mutable_state(self):
+        a = Position(
+            side="BUY", entry_price=100.0, stop_loss=99.0, take_profit=101.0, size=1.0,
+            entry_time=pd.Timestamp("2025-01-01", tz="utc"), entry_fee=0.0, confluence=1,
+        )
+        b = Position(
+            side="BUY", entry_price=100.0, stop_loss=99.0, take_profit=101.0, size=1.0,
+            entry_time=pd.Timestamp("2025-01-01", tz="utc"), entry_fee=0.0, confluence=1,
+        )
+        a.contributing_factors["order_block"] = "bullish"
+        self.assertEqual(b.contributing_factors, {})
+
+
 class TestShortSideIsDiagnosticOnly(unittest.TestCase):
     """allow_short exists only for backtest/tune.py's long-vs-long+short
     diagnostic (see docs/tuning-log.md) - live/trader.py and paper trading
