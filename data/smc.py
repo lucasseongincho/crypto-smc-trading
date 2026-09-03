@@ -331,6 +331,76 @@ DEFAULT_TRENDLINE_POINTS = 3
 DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE = 0.0
 
 
+class _TrendlineTracker:
+    """Shared bar-by-bar state machine for fitting/breaking the two Phase-2
+    trendlines (support from confirmed swing lows, resistance from confirmed swing
+    highs). Used by both detect_trendline and detect_channel (Phase 3) so the two
+    can't silently drift onto different fit/break/invalidate semantics for what is,
+    underneath, the exact same pair of lines - detect_channel's ascending channel
+    literally reuses the support line as its lower boundary, and its descending
+    channel reuses the resistance line as its upper boundary."""
+
+    def __init__(self, swings: list[dict[str, Any]], right_bars: int, trendline_points: int):
+        self.swings_sorted = sorted(swings, key=lambda s: s["index"])
+        self.swing_ptr = 0
+        self.right_bars = right_bars
+        self.trendline_points = trendline_points
+        self.low_points: list[tuple[int, float]] = []
+        self.high_points: list[tuple[int, float]] = []
+        self.support_line: tuple[float, float] | None = None
+        self.resistance_line: tuple[float, float] | None = None
+
+    def advance(self, i: int) -> None:
+        """Confirms any swings newly available as of bar i (same right_bars lag as
+        detect_swings/detect_bos_choch) and refits whichever line just gained a
+        point, once that type has at least trendline_points confirmed swings."""
+        while (
+            self.swing_ptr < len(self.swings_sorted)
+            and self.swings_sorted[self.swing_ptr]["index"] + self.right_bars <= i
+        ):
+            s = self.swings_sorted[self.swing_ptr]
+            if s["type"] == "low":
+                self.low_points.append((s["index"], s["price"]))
+                if len(self.low_points) >= self.trendline_points:
+                    fitted = _fit_line(self.low_points[-self.trendline_points:])
+                    if fitted is not None:
+                        self.support_line = fitted
+            else:
+                self.high_points.append((s["index"], s["price"]))
+                if len(self.high_points) >= self.trendline_points:
+                    fitted = _fit_line(self.high_points[-self.trendline_points:])
+                    if fitted is not None:
+                        self.resistance_line = fitted
+            self.swing_ptr += 1
+
+    def check_trendline_breaks(
+        self, i: int, close: float, ts: str | None, min_break_distance: float,
+    ) -> list[dict[str, Any]]:
+        """Checks close against the current lines and invalidates (support_line/
+        resistance_line -> None) whichever one broke. Two independent checks, not
+        if/elif - see detect_trendline's docstring for why."""
+        events: list[dict[str, Any]] = []
+        if self.support_line is not None:
+            slope, intercept = self.support_line
+            projected = slope * i + intercept
+            if close < projected - min_break_distance:
+                events.append({
+                    "type": "SUPPORT_BREAK", "direction": "bearish",
+                    "price": float(projected), "index": i, "time": ts,
+                })
+                self.support_line = None
+        if self.resistance_line is not None:
+            slope, intercept = self.resistance_line
+            projected = slope * i + intercept
+            if close > projected + min_break_distance:
+                events.append({
+                    "type": "RESISTANCE_BREAK", "direction": "bullish",
+                    "price": float(projected), "index": i, "time": ts,
+                })
+                self.resistance_line = None
+        return events
+
+
 def detect_trendline(
     window: pd.DataFrame,
     swings: list[dict[str, Any]],
@@ -394,56 +464,15 @@ def detect_trendline(
     if not swings or n == 0:
         return {"support": None, "resistance": None, "breaks": []}
 
-    swings_sorted = sorted(swings, key=lambda s: s["index"])
-    swing_ptr = 0
-    low_points: list[tuple[int, float]] = []
-    high_points: list[tuple[int, float]] = []
-    support_line: tuple[float, float] | None = None
-    resistance_line: tuple[float, float] | None = None
+    tracker = _TrendlineTracker(swings, right_bars, trendline_points)
     breaks: list[dict[str, Any]] = []
 
     closes = window["close"].to_numpy(dtype=float)
     times = _all_time_strs(window)
 
     for i in range(n):
-        while swing_ptr < len(swings_sorted) and swings_sorted[swing_ptr]["index"] + right_bars <= i:
-            s = swings_sorted[swing_ptr]
-            if s["type"] == "low":
-                low_points.append((s["index"], s["price"]))
-                if len(low_points) >= trendline_points:
-                    fitted = _fit_line(low_points[-trendline_points:])
-                    if fitted is not None:
-                        support_line = fitted
-            else:
-                high_points.append((s["index"], s["price"]))
-                if len(high_points) >= trendline_points:
-                    fitted = _fit_line(high_points[-trendline_points:])
-                    if fitted is not None:
-                        resistance_line = fitted
-            swing_ptr += 1
-
-        close = closes[i]
-        ts = times[i]
-
-        if support_line is not None:
-            slope, intercept = support_line
-            projected = slope * i + intercept
-            if close < projected - min_trendline_break_distance:
-                breaks.append({
-                    "type": "SUPPORT_BREAK", "direction": "bearish",
-                    "price": float(projected), "index": i, "time": ts,
-                })
-                support_line = None
-
-        if resistance_line is not None:
-            slope, intercept = resistance_line
-            projected = slope * i + intercept
-            if close > projected + min_trendline_break_distance:
-                breaks.append({
-                    "type": "RESISTANCE_BREAK", "direction": "bullish",
-                    "price": float(projected), "index": i, "time": ts,
-                })
-                resistance_line = None
+        tracker.advance(i)
+        breaks.extend(tracker.check_trendline_breaks(i, closes[i], times[i], min_trendline_break_distance))
 
     def _line_dict(line: tuple[float, float] | None) -> dict[str, float] | None:
         if line is None:
@@ -456,9 +485,202 @@ def detect_trendline(
         }
 
     return {
-        "support": _line_dict(support_line),
-        "resistance": _line_dict(resistance_line),
+        "support": _line_dict(tracker.support_line),
+        "resistance": _line_dict(tracker.resistance_line),
         "breaks": breaks,
+    }
+
+
+# TODO: no minimum break-distance filter existed before this parameter, same
+# pattern as DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE - 0.0 (off) is a placeholder for
+# making the assumption visible/configurable, not a chosen value. Deliberately
+# separate from min_trendline_break_distance even though both gate a "close beyond
+# a line" check - the channel's constructed boundary and the underlying trendline
+# are different lines with potentially different noise characteristics, so tying
+# their thresholds together would be an unjustified assumption.
+DEFAULT_MIN_CHANNEL_BREAK_DISTANCE = 0.0
+
+
+def _fit_parallel_line(points: list[tuple[int, float]], slope: float) -> float | None:
+    """Best-fit intercept (least-squares, slope held fixed) for a line through
+    points: minimizes sum((y - (slope*x + b))^2) over b, solved directly by
+    b = mean(y - slope*x). Used to connect the corresponding highs/lows to a
+    channel boundary parallel to an already-fit trendline, rather than anchoring
+    the boundary on a single most-recent touch point - the same least-squares-
+    over-multiple-points preference detect_trendline itself makes (see
+    DEFAULT_TRENDLINE_POINTS), applied here with the slope constrained instead of
+    independently fit. Returns None only if points is empty."""
+    if not points:
+        return None
+    offsets = [y - slope * x for x, y in points]
+    return sum(offsets) / len(offsets)
+
+
+def _channel_bar_events(
+    channel: str, i: int, ts: str | None, close: float, high: float, low: float,
+    lower_val: float, upper_val: float, min_channel_break_distance: float,
+) -> list[dict[str, Any]]:
+    """Per-bar touch/break check against one channel's two boundaries. A CLOSE
+    beyond a boundary is a CHANNEL_BREAK (higher-conviction reversal signal, per
+    the rebuild decision); short of that, a WICK (high/low) reaching the boundary
+    without closing past it is the weaker CHANNEL_TOUCH (potential reversal) -
+    break takes priority over touch on the same bar/boundary, they're not both
+    reported for the same event. Direction convention (a judgment call, since
+    the video doesn't specify labels for these): breaking the upper boundary is
+    "bullish" (price accelerated through the ceiling) and breaking the lower is
+    "bearish" (through the floor) - the same convention detect_trendline's
+    RESISTANCE_BREAK/SUPPORT_BREAK already use, since an ascending channel's lower
+    boundary literally *is* the support line and a descending channel's upper
+    boundary literally *is* the resistance line. A touch carries the *opposite*
+    direction from a break at the same boundary - touching the upper boundary
+    from inside the channel is a potential rejection *down* ("bearish"), touching
+    the lower boundary is a potential bounce *up* ("bullish")."""
+    events: list[dict[str, Any]] = []
+
+    if close > upper_val + min_channel_break_distance:
+        events.append({
+            "type": "CHANNEL_BREAK", "channel": channel, "boundary": "upper",
+            "direction": "bullish", "price": float(upper_val), "index": i, "time": ts,
+        })
+    elif high >= upper_val:
+        events.append({
+            "type": "CHANNEL_TOUCH", "channel": channel, "boundary": "upper",
+            "direction": "bearish", "price": float(upper_val), "index": i, "time": ts,
+        })
+
+    if close < lower_val - min_channel_break_distance:
+        events.append({
+            "type": "CHANNEL_BREAK", "channel": channel, "boundary": "lower",
+            "direction": "bearish", "price": float(lower_val), "index": i, "time": ts,
+        })
+    elif low <= lower_val:
+        events.append({
+            "type": "CHANNEL_TOUCH", "channel": channel, "boundary": "lower",
+            "direction": "bullish", "price": float(lower_val), "index": i, "time": ts,
+        })
+
+    return events
+
+
+def detect_channel(
+    window: pd.DataFrame,
+    swings: list[dict[str, Any]],
+    right_bars: int = 3,
+    trendline_points: int = DEFAULT_TRENDLINE_POINTS,
+    min_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
+    min_channel_break_distance: float = DEFAULT_MIN_CHANNEL_BREAK_DISTANCE,
+) -> dict[str, Any]:
+    """Parallel channel boundaries around the Phase 2 trendlines - Phase 3 of the
+    2026-09 detector rebuild. "A parallel line to the trendline, connecting the
+    corresponding highs/lows, same slope" (the rebuild decision's own phrasing),
+    built two ways depending on which Phase-2 line is currently active:
+
+    - **Ascending channel**: anchored on the *support* line (fit through swing
+      lows) as its **lower** boundary - its **upper** boundary is a new line with
+      the *same slope*, best-fit (via `_fit_parallel_line`) through the most
+      recent `trendline_points` confirmed swing **highs**.
+    - **Descending channel**: anchored on the *resistance* line (fit through
+      swing highs) as its **upper** boundary - its **lower** boundary is fit the
+      same way through the most recent `trendline_points` confirmed swing
+      **lows**.
+
+    Both are tracked simultaneously and independently (there's no "current trend
+    direction" concept left to pick one - classify_swing_trend was removed, not
+    replaced with an equivalent), using the exact same `_TrendlineTracker` state
+    machine detect_trendline uses, so the two functions can't drift onto
+    different ideas of what the "current" support/resistance line is - the
+    ascending channel's lower boundary and detect_trendline's support line are,
+    numerically, the identical line.
+
+    Per bar `i` (after `tracker.advance(i)` confirms/refits same as
+    detect_trendline): if the support line exists **and** at least
+    `trendline_points` swing highs have been confirmed, build the ascending
+    channel's two boundaries at this bar's x-position and check both for
+    touch/break (`_channel_bar_events`); symmetrically for the descending
+    channel. `tracker.check_trendline_breaks` still runs every bar (using
+    `min_break_distance`, the same parameter detect_trendline takes) so the
+    underlying support/resistance lines invalidate at the identical bars they
+    would in detect_trendline - a channel's boundary silently goes stale
+    otherwise. Trendline-native SUPPORT_BREAK/RESISTANCE_BREAK events themselves
+    are **not** duplicated into this function's own `events` list - that break is
+    already exactly the ascending channel's lower-boundary CHANNEL_BREAK (or the
+    descending channel's upper-boundary one), reported once via the mechanism
+    above, not reported again under a different name.
+
+    Returns `{"ascending": {...} | None, "descending": {...} | None, "events":
+    [...]}`. Each channel dict, when not None, is `{"slope", "lower": {
+    "intercept", "value_at_last_index"}, "upper": {"intercept",
+    "value_at_last_index"}}` describing both boundaries as they stand at the end
+    of the window (None if the anchor line is currently invalidated, or if the
+    *other* side never accumulated `trendline_points` confirmed swings).
+    `events` is every CHANNEL_TOUCH/CHANNEL_BREAK across the whole window,
+    chronological - see `_channel_bar_events` for the field shape and the
+    touch-vs-break/direction conventions."""
+    n = len(window)
+    if not swings or n == 0:
+        return {"ascending": None, "descending": None, "events": []}
+
+    tracker = _TrendlineTracker(swings, right_bars, trendline_points)
+    events: list[dict[str, Any]] = []
+
+    highs = window["high"].to_numpy(dtype=float)
+    lows = window["low"].to_numpy(dtype=float)
+    closes = window["close"].to_numpy(dtype=float)
+    times = _all_time_strs(window)
+
+    for i in range(n):
+        tracker.advance(i)
+
+        if tracker.support_line is not None and len(tracker.high_points) >= trendline_points:
+            slope, lower_intercept = tracker.support_line
+            upper_intercept = _fit_parallel_line(tracker.high_points[-trendline_points:], slope)
+            if upper_intercept is not None:
+                events.extend(_channel_bar_events(
+                    "ascending", i, times[i], closes[i], highs[i], lows[i],
+                    slope * i + lower_intercept, slope * i + upper_intercept,
+                    min_channel_break_distance,
+                ))
+
+        if tracker.resistance_line is not None and len(tracker.low_points) >= trendline_points:
+            slope, upper_intercept = tracker.resistance_line
+            lower_intercept = _fit_parallel_line(tracker.low_points[-trendline_points:], slope)
+            if lower_intercept is not None:
+                events.extend(_channel_bar_events(
+                    "descending", i, times[i], closes[i], highs[i], lows[i],
+                    slope * i + lower_intercept, slope * i + upper_intercept,
+                    min_channel_break_distance,
+                ))
+
+        tracker.check_trendline_breaks(i, closes[i], times[i], min_break_distance)
+
+    def _channel_dict(
+        anchor_line: tuple[float, float] | None, other_points: list[tuple[int, float]], anchor_is_lower: bool,
+    ) -> dict[str, Any] | None:
+        if anchor_line is None or len(other_points) < trendline_points:
+            return None
+        slope, anchor_intercept = anchor_line
+        other_intercept = _fit_parallel_line(other_points[-trendline_points:], slope)
+        if other_intercept is None:
+            return None
+        lower_intercept = anchor_intercept if anchor_is_lower else other_intercept
+        upper_intercept = other_intercept if anchor_is_lower else anchor_intercept
+        last_index = n - 1
+        return {
+            "slope": float(slope),
+            "lower": {
+                "intercept": float(lower_intercept),
+                "value_at_last_index": float(slope * last_index + lower_intercept),
+            },
+            "upper": {
+                "intercept": float(upper_intercept),
+                "value_at_last_index": float(slope * last_index + upper_intercept),
+            },
+        }
+
+    return {
+        "ascending": _channel_dict(tracker.support_line, tracker.high_points, anchor_is_lower=True),
+        "descending": _channel_dict(tracker.resistance_line, tracker.low_points, anchor_is_lower=False),
+        "events": events,
     }
 
 
@@ -610,6 +832,7 @@ def compute_smc_features(
     min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
     trendline_points: int = DEFAULT_TRENDLINE_POINTS,
     min_trendline_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
+    min_channel_break_distance: float = DEFAULT_MIN_CHANNEL_BREAK_DISTANCE,
 ) -> dict[str, Any]:
     """OHLCV DataFrame -> SMC structure feature dict. Pure computation, no
     buy/sell judgment (see signals/smc_aggregator.py for that)."""
@@ -634,9 +857,21 @@ def compute_smc_features(
     structure_events = detect_bos_choch(
         window, swings, right_bars=swing_right_bars, min_break_distance=min_break_distance,
     )
+    # detect_trendline and detect_channel each build their own _TrendlineTracker
+    # over the same swings list and parameters - a known, deliberate duplication
+    # of the confirm/refit bar loop (same category as the pre-shared-ATR
+    # duplication _atr's own sharing above was written to avoid), left as-is for
+    # now since Phase 2/3 aren't on the tuning grid's hot path yet (the grid isn't
+    # being re-run as part of this rebuild - see docs/detector-logic.md). Worth
+    # revisiting the same way if/when this path gets tuned-grid-hot again.
     trendline = detect_trendline(
         window, swings, right_bars=swing_right_bars, trendline_points=trendline_points,
         min_trendline_break_distance=min_trendline_break_distance,
+    )
+    channel = detect_channel(
+        window, swings, right_bars=swing_right_bars, trendline_points=trendline_points,
+        min_break_distance=min_trendline_break_distance,
+        min_channel_break_distance=min_channel_break_distance,
     )
     fakeout = detect_fakeout(window, swings)
 
@@ -646,6 +881,7 @@ def compute_smc_features(
         "fvgs": fvgs,
         "swings": swings,
         "trendline": trendline,
+        "channel": channel,
         "structure_events": structure_events,
         "structure_bias": structure_events[-1]["direction"] if structure_events else None,
         "fakeout": fakeout,

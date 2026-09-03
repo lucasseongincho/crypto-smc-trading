@@ -15,6 +15,7 @@ import pandas as pd
 from data.smc import (
     compute_smc_features,
     detect_bos_choch,
+    detect_channel,
     detect_fvg,
     detect_order_blocks,
     detect_swings,
@@ -26,6 +27,48 @@ def _df_from_ohlc(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame
     df = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
     df.index = pd.date_range("2026-01-01", periods=len(df), freq="5min", tz="utc")
     return df
+
+
+def _build_zigzag_ohlc(
+    extremes: list[tuple[int, float, str]], start_price: float = 180.0, extreme_wick: float = 0.5,
+) -> list[tuple[float, float, float, float]]:
+    """Builds OHLC rows that pass through each (index, price, 'low'|'high') extreme
+    as a clean, unambiguous 3-left/3-right fractal - each extreme candle gets an
+    exaggerated wick beyond its own body in the extreme's direction (every other
+    candle is body-only, high=max(open,close)/low=min(open,close)), and prices
+    move strictly monotonically between consecutive extremes. Used for
+    detect_trendline/detect_channel tests, where hand-picking OHLC values that
+    both form a clean swing *and* land on a specific regression-fit price is
+    otherwise fiddly to get right by hand."""
+    total = extremes[-1][0] + 4
+    targets: list[float | None] = [None] * total
+    anchors = [(-1, start_price)] + [(idx, price) for idx, price, _ in extremes]
+    for (i0, p0), (i1, p1) in zip(anchors, anchors[1:]):
+        steps = i1 - i0
+        for k in range(1, steps + 1):
+            i = i0 + k
+            targets[i] = p0 + (p1 - p0) * (k / steps)
+    last_idx, last_price = anchors[-1]
+    _, prev_price = anchors[-2]
+    for i in range(last_idx + 1, total):
+        targets[i] = last_price + (last_price - prev_price) * 0.1 * (i - last_idx)
+
+    extreme_map = {idx: kind for idx, _, kind in extremes}
+    rows: list[tuple[float, float, float, float]] = []
+    prev_close = start_price
+    for i in range(total):
+        open_ = prev_close
+        close = targets[i]
+        body_hi, body_lo = max(open_, close), min(open_, close)
+        if extreme_map.get(i) == "low":
+            hi, lo = body_hi, body_lo - extreme_wick
+        elif extreme_map.get(i) == "high":
+            hi, lo = body_hi + extreme_wick, body_lo
+        else:
+            hi, lo = body_hi, body_lo
+        rows.append((open_, hi, lo, close))
+        prev_close = close
+    return rows
 
 
 class TestBosChochStaleBiasRegression(unittest.TestCase):
@@ -317,6 +360,139 @@ class TestDetectTrendline(unittest.TestCase):
         self.assertIn("trendline", feats)
         self.assertNotIn("swing_trend", feats)
         self.assertEqual(len(feats["trendline"]["breaks"]), 1)
+
+
+class TestDetectChannel(unittest.TestCase):
+    """Phase 3 of the 2026-09 detector rebuild: parallel channel boundaries around
+    the Phase 2 trendlines. Fixture: perfectly collinear swing lows at (3,100),
+    (13,110),(23,120) and swing highs at (9,250),(19,260),(29,270) - both slope
+    1.0 by construction, support intercept 96.5 (shifted -0.5 by the extreme
+    wick), resistance intercept 241.5 - so support and resistance end up
+    numerically parallel here, and the ascending/descending channels end up
+    identical, which is a useful cross-check, not a limitation of the test."""
+
+    def setUp(self):
+        extremes = [
+            (3, 100.0, "low"), (9, 250.0, "high"), (13, 110.0, "low"),
+            (19, 260.0, "high"), (23, 120.0, "low"), (29, 270.0, "high"), (33, 230.0, "low"),
+        ]
+        rows = _build_zigzag_ohlc(extremes)
+        # Hand-appended candles isolating one touch/break per bar against the
+        # boundaries implied by slope=1.0, support intercept=96.5, resistance
+        # intercept=241.5 (upper = i+241.5, lower = i+96.5):
+        rows += [
+            (rows[-1][3], 278.5, 250.0, 270.0),  # i=37: high==upper(278.5) exactly, close stays inside -> touch upper
+            (270.0, 291.0, 260.0, 290.0),         # i=38: close(290) > upper(279.5) -> break upper
+            (290.0, 200.0, 135.5, 150.0),          # i=39: low==lower(135.5) exactly, close stays inside -> touch lower
+            (150.0, 151.0, 99.0, 100.0),           # i=40: close(100) < lower(136.5) -> break lower
+        ]
+        self.df = _df_from_ohlc(rows)
+        self.swings = detect_swings(self.df, left_bars=3, right_bars=3)
+
+    def test_fixture_swings_are_as_designed(self):
+        lows = [(s["index"], s["price"]) for s in self.swings if s["type"] == "low"]
+        highs = [(s["index"], s["price"]) for s in self.swings if s["type"] == "high"]
+        self.assertEqual(lows, [(3, 99.5), (13, 109.5), (23, 119.5)])
+        self.assertEqual(highs, [(9, 250.5), (19, 260.5), (29, 270.5)])
+
+    def test_ascending_and_descending_channels_share_the_same_slope_and_boundaries(self):
+        result = detect_channel(self.df.iloc[:34], self.swings, right_bars=3, trendline_points=3)
+        self.assertIsNotNone(result["ascending"])
+        self.assertIsNotNone(result["descending"])
+        self.assertAlmostEqual(result["ascending"]["slope"], 1.0)
+        self.assertAlmostEqual(result["descending"]["slope"], 1.0)
+        self.assertAlmostEqual(result["ascending"]["lower"]["intercept"], 96.5)
+        self.assertAlmostEqual(result["ascending"]["upper"]["intercept"], 241.5)
+        # Ascending's lower boundary is literally the support line; descending's
+        # upper boundary is literally the resistance line - same numbers either way.
+        self.assertAlmostEqual(
+            result["ascending"]["lower"]["intercept"], result["descending"]["lower"]["intercept"],
+        )
+        self.assertAlmostEqual(
+            result["ascending"]["upper"]["intercept"], result["descending"]["upper"]["intercept"],
+        )
+
+    def test_touch_upper_boundary_fires_on_wick_without_close_breaking(self):
+        result = detect_channel(self.df.iloc[:38], self.swings, right_bars=3, trendline_points=3)
+        touches = [e for e in result["events"] if e["index"] == 37]
+        self.assertEqual(len(touches), 2)  # both channels share this boundary here
+        for e in touches:
+            self.assertEqual(e["type"], "CHANNEL_TOUCH")
+            self.assertEqual(e["boundary"], "upper")
+            self.assertEqual(e["direction"], "bearish")  # touching a ceiling -> potential reversal down
+            self.assertAlmostEqual(e["price"], 278.5)
+
+    def test_break_upper_boundary_fires_on_close_beyond_it(self):
+        result = detect_channel(self.df.iloc[:39], self.swings, right_bars=3, trendline_points=3)
+        breaks = [e for e in result["events"] if e["index"] == 38]
+        self.assertEqual(len(breaks), 2)
+        for e in breaks:
+            self.assertEqual(e["type"], "CHANNEL_BREAK")
+            self.assertEqual(e["boundary"], "upper")
+            self.assertEqual(e["direction"], "bullish")  # breaking a ceiling -> bullish, mirrors RESISTANCE_BREAK
+            self.assertAlmostEqual(e["price"], 279.5)
+
+    def test_touch_lower_boundary_fires_on_wick_without_close_breaking(self):
+        result = detect_channel(self.df.iloc[:40], self.swings, right_bars=3, trendline_points=3)
+        touches = [e for e in result["events"] if e["index"] == 39 and e["type"] == "CHANNEL_TOUCH"]
+        self.assertEqual(len(touches), 1)  # descending channel already invalidated by the i=38 break
+        e = touches[0]
+        self.assertEqual(e["boundary"], "lower")
+        self.assertEqual(e["direction"], "bullish")  # touching a floor -> potential bounce up
+        self.assertAlmostEqual(e["price"], 135.5)
+
+    def test_break_lower_boundary_fires_on_close_beyond_it(self):
+        result = detect_channel(self.df, self.swings, right_bars=3, trendline_points=3)
+        breaks = [e for e in result["events"] if e["index"] == 40 and e["type"] == "CHANNEL_BREAK"]
+        self.assertEqual(len(breaks), 1)
+        e = breaks[0]
+        self.assertEqual(e["boundary"], "lower")
+        self.assertEqual(e["direction"], "bearish")  # breaking a floor -> bearish, mirrors SUPPORT_BREAK
+        self.assertAlmostEqual(e["price"], 136.5)
+
+    def test_channel_invalidates_after_its_anchor_line_breaks(self):
+        # descending channel's upper boundary IS the resistance line - once that
+        # breaks (i=38), the descending channel must be gone from then on.
+        result = detect_channel(self.df, self.swings, right_bars=3, trendline_points=3)
+        self.assertIsNone(result["descending"])
+        # ascending channel's lower boundary IS the support line - it breaks too,
+        # at i=40, so by the end of this fixture it's also gone.
+        self.assertIsNone(result["ascending"])
+
+    def test_fewer_than_trendline_points_of_the_other_side_yields_no_channel(self):
+        # Only 2 confirmed swing lows exist yet (index 23's isn't confirmed until
+        # i=26) - even though the highs already have 2 confirmed points too, no
+        # channel exists without >= trendline_points on *both* sides.
+        truncated = self.df.iloc[:20]
+        swings = detect_swings(truncated, left_bars=3, right_bars=3)
+        result = detect_channel(truncated, swings, right_bars=3, trendline_points=3)
+        self.assertIsNone(result["ascending"])
+        self.assertIsNone(result["descending"])
+
+    def test_no_swings_at_all_yields_no_channel(self):
+        result = detect_channel(self.df, [], right_bars=3, trendline_points=3)
+        self.assertEqual(result, {"ascending": None, "descending": None, "events": []})
+
+    def test_min_channel_break_distance_filters_small_breaks(self):
+        # The i=38 close (290) clears the upper boundary (279.5) by 10.5.
+        small = detect_channel(
+            self.df.iloc[:39], self.swings, right_bars=3, trendline_points=3,
+            min_channel_break_distance=5.0,
+        )
+        self.assertTrue(any(e["index"] == 38 and e["type"] == "CHANNEL_BREAK" for e in small["events"]))
+
+        large = detect_channel(
+            self.df.iloc[:39], self.swings, right_bars=3, trendline_points=3,
+            min_channel_break_distance=50.0,
+        )
+        self.assertFalse(any(e["index"] == 38 and e["type"] == "CHANNEL_BREAK" for e in large["events"]))
+
+    def test_compute_smc_features_exposes_channel(self):
+        feats = compute_smc_features(self.df, lookback_bars=len(self.df))
+        self.assertIn("channel", feats)
+        self.assertIn("ascending", feats["channel"])
+        self.assertIn("descending", feats["channel"])
+        self.assertIn("events", feats["channel"])
 
 
 class TestNewSizeFilterParametersDefaultToOff(unittest.TestCase):

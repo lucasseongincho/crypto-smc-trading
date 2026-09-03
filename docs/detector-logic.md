@@ -199,6 +199,99 @@ confirmed swings of that type ever existed, or the line was invalidated by a bre
 with nothing yet refit. `breaks` is every event across the whole window,
 chronological, same field shape as `detect_bos_choch`'s events.
 
+Both `detect_trendline` and `detect_channel` (next section) build their own
+`_TrendlineTracker` internally rather than sharing one instance — a known,
+deliberate duplication of the confirm/refit bar loop inside
+`compute_smc_features`, left as-is since this path isn't on the tuning grid's hot
+path (the grid isn't being re-run as part of this rebuild).
+
+---
+
+## Channel (`detect_channel`, new, 2026-09)
+
+Parallel channel boundaries around the Phase 2 trendlines — Phase 3 of the
+detector rebuild. The rebuild decision's own framing: "a parallel line to the
+trendline, connecting the corresponding highs/lows, same slope." Built two ways,
+tracked simultaneously (there's no "current trend direction" concept left to pick
+just one — `classify_swing_trend` was removed, not replaced with an equivalent):
+
+- **Ascending channel**: the **support** line (from swing lows) is the **lower**
+  boundary, reused exactly as `detect_trendline` computes it. The **upper**
+  boundary is a *new* line with the identical slope, best-fit via
+  `_fit_parallel_line` through the most recent `trendline_points` confirmed swing
+  **highs**.
+- **Descending channel**: mirror image — the **resistance** line (from swing
+  highs) is the **upper** boundary; the **lower** boundary is fit through the
+  most recent `trendline_points` confirmed swing **lows**, same slope as
+  resistance.
+
+**Fixed-slope fit (`_fit_parallel_line`).** Given a slope and a set of `(index,
+price)` points, the best intercept by least-squares is `mean(price - slope *
+index)` — the closed-form minimizer of `sum((y - (slope*x + b))^2)` over `b`
+alone. This connects *all* the corresponding-type points to the parallel
+boundary (consistent with `detect_trendline`'s own preference for fitting over
+`trendline_points` points rather than anchoring on one touch), not just the
+single most recent high/low.
+
+**Shared state, not reimplemented state.** `detect_channel` uses the exact same
+`_TrendlineTracker` class `detect_trendline` uses — same `advance()`
+confirm/refit logic, same `check_trendline_breaks()` invalidation logic, same
+`min_break_distance`-style parameter for it (passed as `min_break_distance` here
+too, not renamed). This isn't a style preference: the ascending channel's lower
+boundary and `detect_trendline`'s support line are, numerically, the identical
+line, computed the identical way — reusing the tracker is what *guarantees* that
+identity rather than merely documenting an intent that two independent
+implementations could silently drift away from.
+
+**Per bar `i`** (after `tracker.advance(i)`): if the anchor line exists **and**
+the *other* side has accumulated at least `trendline_points` confirmed swings,
+project both boundaries to this bar's x-position and check touch/break
+(`_channel_bar_events`) — independently for the ascending and descending
+channels; both, one, or neither can be active on a given bar depending on which
+lines currently exist. `tracker.check_trendline_breaks()` still runs every bar
+afterward so the anchor lines invalidate at the identical point
+`detect_trendline` would report — a channel's boundary would otherwise silently
+go stale relative to its own anchor line.
+
+**Touch vs. break — the actual rule.** A `CHANNEL_BREAK` (close beyond a
+boundary — the "higher-conviction trend-reversal signal" the rebuild decision
+asked for) takes priority over a `CHANNEL_TOUCH` (wick reaches the boundary
+without close following through — "potential reversal") on the same bar/
+boundary; they are not both reported for the same event. **Direction
+convention** (a judgment call — the video doesn't label these): breaking the
+**upper** boundary is `"bullish"` and breaking the **lower** is `"bearish"` — the
+same convention `detect_trendline`'s `RESISTANCE_BREAK`/`SUPPORT_BREAK` already
+use, since an ascending channel's lower boundary literally *is* the support line
+and a descending channel's upper boundary literally *is* the resistance line. A
+**touch** carries the *opposite* direction from a break at the same boundary —
+touching the upper boundary from inside the channel implies a potential
+rejection *down* (`"bearish"`), touching the lower boundary implies a potential
+bounce *up* (`"bullish"`).
+
+**Not duplicated:** a channel-anchor break (e.g. the ascending channel's lower
+boundary breaking) is reported once, here, as a `CHANNEL_BREAK`. It is *not*
+also separately reported as `detect_trendline`'s `SUPPORT_BREAK` under a
+different name inside this function's own `events` list — that event exists in
+`detect_trendline`'s own `breaks` list instead; a caller wanting both needs both
+functions' outputs (`compute_smc_features` calls both, see below).
+
+**Parameters:**
+
+| Param | Default | Status |
+|---|---|---|
+| `trendline_points` | `3` (`DEFAULT_TRENDLINE_POINTS`, shared with `detect_trendline`) | Same TODO as `detect_trendline`'s. Also gates the *other*-side minimum here — an ascending channel needs `trendline_points` confirmed highs, not just an existing support line. |
+| `min_break_distance` | `0.0` (`DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE`, shared with `detect_trendline`) | Gates the anchor line's own invalidation via `tracker.check_trendline_breaks` — literally the same parameter/threshold `detect_trendline` uses for the identical line. |
+| `min_channel_break_distance` | `0.0` (`DEFAULT_MIN_CHANNEL_BREAK_DISTANCE`) | **Explicit TODO**, deliberately a *separate* parameter from `min_break_distance` even though both gate "close beyond a line" — the constructed parallel boundary and the underlying trendline are different lines with potentially different noise characteristics, so tying their thresholds together would be an unjustified assumption. |
+| `right_bars` | `3` (reused from `swing_right_bars`) | Same as `detect_trendline`. |
+
+**Output shape.** `{"ascending": {...} | None, "descending": {...} | None,
+"events": [...]}`. Each channel dict, when not `None`: `{"slope", "lower":
+{"intercept", "value_at_last_index"}, "upper": {"intercept",
+"value_at_last_index"}}`, describing both boundaries as they stand at the end of
+the window. `events` is every `CHANNEL_TOUCH`/`CHANNEL_BREAK` across the whole
+window, chronological, each `{"type", "channel": "ascending"|"descending",
+"boundary": "upper"|"lower", "direction", "price", "index", "time"}`.
+
 ---
 
 ## BOS / CHoCH (`detect_bos_choch`, lines 269-360)
