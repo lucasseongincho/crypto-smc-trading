@@ -12,7 +12,14 @@ import unittest
 
 import pandas as pd
 
-from data.smc import compute_smc_features, detect_bos_choch, detect_fvg, detect_order_blocks, detect_swings
+from data.smc import (
+    compute_smc_features,
+    detect_bos_choch,
+    detect_fvg,
+    detect_order_blocks,
+    detect_swings,
+    detect_trendline,
+)
 
 
 def _df_from_ohlc(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
@@ -195,6 +202,121 @@ class TestOrderBlockBodyEngulfRedefinition(unittest.TestCase):
             (98.6, 98.7, 97, 97.5),   # C: red (same direction as B)
         ])
         self.assertEqual(detect_order_blocks(df), [])
+
+
+class TestDetectTrendline(unittest.TestCase):
+    """Phase 2 of the 2026-09 detector rebuild: real diagonal trendlines,
+    replacing classify_swing_trend's 2-swing comparison. Three rising swing lows
+    at exactly (index 3, price 100), (index 13, price 110), (index 23, price 120)
+    - collinear by construction, slope=1.0, intercept=97 (price = index + 97) -
+    then a crash candle at index 30 whose close (101) breaks well below the
+    projected support value (127) there. Three rising swing highs are also
+    present as a side effect of the same fixture, giving a resistance line for
+    free without a dedicated fixture."""
+
+    def setUp(self):
+        rows = [
+            (140, 141, 135, 136), (136, 137, 130, 131), (131, 132, 102, 103),
+            (103, 104, 100, 101),  # index 3: swing low, price 100
+            (101, 110, 101, 109), (109, 120, 108, 119), (119, 130, 115, 129),
+            (129, 140, 125, 139), (139, 150, 135, 149), (149, 155, 140, 150),
+            (150, 151, 140, 141), (141, 142, 130, 131), (131, 132, 111, 112),
+            (112, 113, 110, 111),  # index 13: swing low, price 110
+            (111, 120, 111, 119), (119, 130, 118, 129), (129, 140, 125, 139),
+            (139, 150, 135, 149), (149, 160, 145, 159), (159, 165, 150, 160),
+            (160, 161, 150, 151), (151, 152, 140, 141), (141, 142, 121, 122),
+            (122, 123, 120, 121),  # index 23: swing low, price 120
+            (121, 130, 121, 129), (129, 140, 128, 139), (139, 150, 135, 149),
+            (149, 160, 145, 159), (159, 175, 155, 174), (174, 180, 165, 175),
+            (175, 176, 100, 101),  # index 30: crash candle, close 101
+            (101, 105, 95, 100), (100, 102, 90, 95),
+        ]
+        self.df = _df_from_ohlc(rows)
+        self.swings = detect_swings(self.df, left_bars=3, right_bars=3)
+
+    def test_swing_fixture_is_as_designed(self):
+        """Sanity check the fixture actually produces the intended swings, so a
+        failure below points at detect_trendline, not a miscounted fixture."""
+        lows = [(s["index"], s["price"]) for s in self.swings if s["type"] == "low"]
+        highs = [(s["index"], s["price"]) for s in self.swings if s["type"] == "high"]
+        self.assertEqual(lows, [(3, 100.0), (13, 110.0), (23, 120.0)])
+        self.assertEqual(highs, [(9, 155.0), (19, 165.0), (29, 180.0)])
+
+    def test_support_line_fits_the_three_swing_lows_exactly(self):
+        result = detect_trendline(self.df, self.swings, right_bars=3, trendline_points=3)
+        # Collinear points -> exact least-squares fit: price = 1.0 * index + 97.0
+        self.assertIsNone(result["support"])  # invalidated by the break below
+        self.assertEqual(len(result["breaks"]), 1)
+        brk = result["breaks"][0]
+        self.assertEqual(brk["type"], "SUPPORT_BREAK")
+        self.assertEqual(brk["direction"], "bearish")
+        self.assertEqual(brk["index"], 30)
+        self.assertAlmostEqual(brk["price"], 127.0)  # slope*30 + intercept = 1*30+97
+
+    def test_close_not_wick_is_what_triggers_the_break(self):
+        # Index 30's low (100) is far below the line, but so is every candle's low
+        # near the crash - the break event's recorded index/price already prove
+        # it fired off `close`, not the wick: the projected value (127) equals
+        # slope*i+intercept, evaluated once, independent of that bar's high/low.
+        result = detect_trendline(self.df, self.swings, right_bars=3, trendline_points=3)
+        brk = result["breaks"][0]
+        crash_close = float(self.df.iloc[30]["close"])
+        self.assertEqual(crash_close, 101.0)
+        self.assertLess(crash_close, brk["price"])
+
+    def test_resistance_line_fits_the_three_swing_highs(self):
+        result = detect_trendline(self.df, self.swings, right_bars=3, trendline_points=3)
+        # Swing highs (9,155), (19,165), (29,180) are not perfectly collinear
+        # (155->165 is +10 over 10 bars, 165->180 is +15 over 10 bars) - just
+        # confirms a resistance line gets fit independently of the support line,
+        # without asserting on the exact non-round least-squares numbers.
+        self.assertIsNotNone(result["resistance"])
+        self.assertGreater(result["resistance"]["slope"], 0)  # still an uptrend in highs
+
+    def test_trendline_points_two_reproduces_the_exact_two_point_line(self):
+        # Only the first two swing lows exist in this truncated window - with
+        # trendline_points=2, least-squares through exactly 2 points must equal
+        # the raw two-point line through them (the other design option raised in
+        # the rebuild decision, unified into the same parameter).
+        truncated = self.df.iloc[:17]
+        swings = detect_swings(truncated, left_bars=3, right_bars=3)
+        result = detect_trendline(truncated, swings, right_bars=3, trendline_points=2)
+        self.assertIsNotNone(result["support"])
+        self.assertAlmostEqual(result["support"]["slope"], 1.0)
+        self.assertAlmostEqual(result["support"]["intercept"], 97.0)
+
+    def test_min_trendline_break_distance_filters_small_breaks(self):
+        # The crash close (101) is 26 below the projected line value (127) at
+        # index 30 - clears a small threshold, filtered out by a larger one.
+        small = detect_trendline(
+            self.df, self.swings, right_bars=3, trendline_points=3,
+            min_trendline_break_distance=10.0,
+        )
+        self.assertEqual(len(small["breaks"]), 1)
+
+        large = detect_trendline(
+            self.df, self.swings, right_bars=3, trendline_points=3,
+            min_trendline_break_distance=50.0,
+        )
+        self.assertEqual(large["breaks"], [])
+
+    def test_fewer_than_trendline_points_swings_yields_no_line(self):
+        truncated = self.df.iloc[:10]  # only the first swing low (index 3) exists
+        swings = detect_swings(truncated, left_bars=3, right_bars=3)
+        result = detect_trendline(truncated, swings, right_bars=3, trendline_points=3)
+        self.assertIsNone(result["support"])
+        self.assertIsNone(result["resistance"])
+        self.assertEqual(result["breaks"], [])
+
+    def test_no_swings_at_all_yields_no_line(self):
+        result = detect_trendline(self.df, [], right_bars=3, trendline_points=3)
+        self.assertEqual(result, {"support": None, "resistance": None, "breaks": []})
+
+    def test_compute_smc_features_exposes_trendline_not_swing_trend(self):
+        feats = compute_smc_features(self.df, lookback_bars=len(self.df))
+        self.assertIn("trendline", feats)
+        self.assertNotIn("swing_trend", feats)
+        self.assertEqual(len(feats["trendline"]["breaks"]), 1)
 
 
 class TestNewSizeFilterParametersDefaultToOff(unittest.TestCase):

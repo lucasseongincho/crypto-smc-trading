@@ -90,13 +90,24 @@ even 1-and-1. 3-and-3 is stricter/slower to confirm than the more common version
 worth knowing when comparing "how many swings did this find" against another tool or
 another timeframe.
 
-### `classify_swing_trend` (lines 239-255)
+### `classify_swing_trend` — removed, replaced by `detect_trendline` (2026-09 rebuild, Phase 2)
 
-Not one of the 6 detectors the original audit asked about by name, but it's the fourth
-confluence vote (`swing_trend`) — documented here since it's small.
+**This function no longer exists.** It was a 2-swing higher-high/higher-low
+comparison that never actually fit a diagonal line despite its name (the exact
+logic that used to live here is preserved below, for anyone diffing against an
+older version of this doc, but the code itself is gone — `git log` has the removal
+commit). It has been **replaced, not extended**, by a real trendline detector — see
+[Trendline](#trendline-detect_trendline-new-2026-09) below — per the rebuild
+decision: keeping both under similar names would have been confusing about which
+one a reader should trust. `compute_smc_features`'s output no longer has a
+`swing_trend` key at all; `signals/smc_aggregator.py`'s vote on it was retired in
+the same rebuild's aggregator-rewire phase (Phase 5 — see that section).
 
-**Literal condition**, using only the **last two** swing highs and **last two** swing
-lows in the (already lookback-limited) swing list:
+<details>
+<summary>Retired logic, for reference only</summary>
+
+Using only the **last two** swing highs and **last two** swing lows in the
+(already lookback-limited) swing list:
 
 ```
 hh = highs[-1]["price"] > highs[-2]["price"]
@@ -108,12 +119,85 @@ if lh and ll: return "DOWNTREND"
 return "RANGING"
 ```
 
-Requires `len(lows) >= 2 and len(highs) >= 2`, else unconditionally `"RANGING"`. No
+Required `len(lows) >= 2 and len(highs) >= 2`, else unconditionally `"RANGING"`. No
 threshold beyond strict `>`/`<` — an exact tie (or the "neither higher-high-higher-low
-nor lower-high-lower-low" case, e.g. higher high + lower low) falls through to
-`"RANGING"`. No parameters. Despite the module's `classify_swing_trend` naming, this
-does **not** fit or draw an actual trendline — it's a 2-point comparison, as its own
-docstring already says.
+nor lower-high-lower-low" case, e.g. higher high + lower low) fell through to
+`"RANGING"`. No parameters.
+
+</details>
+
+---
+
+## Trendline (`detect_trendline`, new, 2026-09)
+
+Real diagonal trendlines — Phase 2 of the detector rebuild, replacing
+`classify_swing_trend` above. Fits **two independent lines**: a **support** line
+through confirmed swing **lows** (the uptrend line) and a **resistance** line
+through confirmed swing **highs** (the downtrend line), via least-squares over the
+most recent `trendline_points` confirmed swings of each type.
+
+**Exact-math choice (the video doesn't specify this).** The rebuild decision raised
+two options: least-squares over the last N points, or a raw two-point line through
+the most recent unbroken pair, extended forward. `_fit_line` unifies both: ordinary
+least-squares reduces *exactly* to the two-point line when given exactly 2 points
+(there's only one line through 2 points, and that's what least-squares finds), so
+`trendline_points=2` reproduces the "two-point line" option exactly, while
+`trendline_points=3` (the chosen default, `DEFAULT_TRENDLINE_POINTS`) gets a
+genuine regression fit. Like `lookback_bars`, `3` is a functional placeholder, not
+a value validated against 5-minute BTC/USD bars — same TODO treatment.
+
+**Literal condition.** Structurally close to `detect_bos_choch` (same
+confirmation-lag guard via `right_bars`, same overall bar-by-bar loop shape), with
+two real differences: it tracks two lines instead of one bias, and it fits a
+continuous function instead of tracking a single pending level.
+
+- Per bar `i`, first process every swing newly confirmed as of this bar
+  (`swing["index"] + right_bars <= i`, identical lag to `detect_swings`/
+  `detect_bos_choch`): append it to a running, **never-reset** list
+  (`low_points` for swing lows, `high_points` for swing highs). Once a list has
+  at least `trendline_points` entries, refit that type's line from the most
+  recent `trendline_points` of them (`_fit_line`, plain least-squares — sums of
+  `x`, `y`, `xy`, `x²` over the point set, no numpy dependency added).
+- Then, independently for each line that currently exists, project it to this
+  bar's x-position (`slope * i + intercept`) and compare against **`close`, not
+  the bar's high/low** — the same close-vs-wick discipline `detect_bos_choch`'s
+  close-crossing phase uses:
+  - Support: `close < projected - min_trendline_break_distance` → append
+    `{"type": "SUPPORT_BREAK", "direction": "bearish", "price": projected,
+    "index": i, "time": ts}`, then set the support line to `None` (invalidated;
+    stays `None` until enough new lows accumulate to refit — `low_points` itself
+    is never cleared, so the next confirmed low naturally triggers a refit).
+  - Resistance: mirror image, `close > projected + min_trendline_break_distance`
+    → `RESISTANCE_BREAK`, `direction: "bullish"`.
+  - These are two **independent `if`s, not `if`/`elif`** (unlike
+    `detect_bos_choch`'s single pending-level check) — a support break and a
+    resistance break concern two unrelated lines and could in principle both
+    fire on the same bar.
+
+**Deliberately not carried over from `detect_bos_choch`.** No equivalent of the
+wick-based "supersession" phase (the mechanism that lets a newly-confirmed swing
+already being past a pending *level* fire an event even without a close-crossing).
+A continuously-projected line doesn't have a clean analog of "the new swing is
+already past the old level" — the projected value changes every bar, not just at
+swing-confirmation points — so trendline breaks are close-crossing only. A
+documented scoping choice, same treatment as `min_break_distance`'s scoping note
+above.
+
+**Parameters:**
+
+| Param | Default | Status |
+|---|---|---|
+| `trendline_points` | `3` (`DEFAULT_TRENDLINE_POINTS`) | **Explicit TODO**, same pattern as `lookback_bars`. `2` exactly reproduces the "two-point line through the most recent pair" alternative (see above); `3+` is a genuine least-squares fit. |
+| `min_trendline_break_distance` | `0.0` (`DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE`) | **Explicit TODO**, same pattern as `min_break_distance`. `0.0` means any close beyond the projected line value, however small, counts as a break. |
+| `right_bars` | `3` (reused from `swing_right_bars`) | Not independently configurable — tied 1:1 to the swing detector's `right_bars`, same as `detect_bos_choch`. |
+
+**Output shape.** `{"support": {...} | None, "resistance": {...} | None,
+"breaks": [...]}`. `support`/`resistance`, when not `None`, describe the line **as
+it stands at the end of the window**: `{"slope", "intercept",
+"value_at_last_index"}` — `None` means either fewer than `trendline_points`
+confirmed swings of that type ever existed, or the line was invalidated by a break
+with nothing yet refit. `breaks` is every event across the whole window,
+chronological, same field shape as `detect_bos_choch`'s events.
 
 ---
 

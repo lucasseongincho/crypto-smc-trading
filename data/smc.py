@@ -283,23 +283,183 @@ def detect_swings(window: pd.DataFrame, left_bars: int = 3, right_bars: int = 3)
     return swings
 
 
-def classify_swing_trend(lows: list[dict[str, Any]], highs: list[dict[str, Any]]) -> str:
-    """UPTREND/DOWNTREND/RANGING from the last 2 swing highs/lows (higher-high+higher-low,
-    or lower-high+lower-low). Despite the name this doesn't draw an actual diagonal
-    trendline - it's a 2-swing comparison classifier, same as the original."""
-    if len(lows) < 2 or len(highs) < 2:
-        return "RANGING"
+# classify_swing_trend was removed in the 2026-09 detector rebuild (Phase 2) - it's
+# replaced by detect_trendline() below, not extended by it. The old function was a
+# 2-swing higher-high/higher-low comparison that never actually fit a line despite
+# its name (see git history / docs/detector-logic.md for the retired behavior);
+# keeping both under similar names would have been confusing about which one a
+# reader should trust. Nothing in this codebase calls classify_swing_trend anymore.
 
-    hh = highs[-1]["price"] > highs[-2]["price"]
-    hl = lows[-1]["price"] > lows[-2]["price"]
-    lh = highs[-1]["price"] < highs[-2]["price"]
-    ll = lows[-1]["price"] < lows[-2]["price"]
 
-    if hh and hl:
-        return "UPTREND"
-    if lh and ll:
-        return "DOWNTREND"
-    return "RANGING"
+def _fit_line(points: list[tuple[int, float]]) -> tuple[float, float] | None:
+    """Least-squares line (slope, intercept) through (index, price) points, i.e.
+    price = slope * index + intercept. Returns None if fewer than 2 points, or (in
+    principle, never actually reachable here since swing indices are always
+    distinct) all points share one x value. With exactly 2 points this reduces
+    exactly to the two-point line through them - see detect_trendline's docstring
+    for why that's a deliberate unification, not a coincidence."""
+    n = len(points)
+    if n < 2:
+        return None
+    sum_x = sum(p[0] for p in points)
+    sum_y = sum(p[1] for p in points)
+    sum_xy = sum(p[0] * p[1] for p in points)
+    sum_xx = sum(p[0] * p[0] for p in points)
+    denom = n * sum_xx - sum_x * sum_x
+    if denom == 0:
+        return None
+    slope = (n * sum_xy - sum_x * sum_y) / denom
+    intercept = (sum_y - slope * sum_x) / n
+    return slope, intercept
+
+
+# TODO: the reference video specifies "fit a line through the swings" without
+# specifying exact math (least-squares over N points vs. a raw two-point line
+# through the most recent pair, extended forward). trendline_points=3 was chosen as
+# the smallest N that produces a genuine least-squares fit rather than degenerating
+# to the two-point case (trendline_points=2 exactly reproduces "two-point line
+# through the most recent unbroken pair," since least squares through exactly 2
+# points is the line through them, so both options the decision note raised are
+# available via this one parameter - 2 for the raw two-point line, 3+ for an actual
+# regression). Like lookback_bars, this is a functional placeholder, not a value
+# validated against 5-minute BTC/USD bars.
+DEFAULT_TRENDLINE_POINTS = 3
+
+# TODO: same pattern as DEFAULT_MIN_BREAK_DISTANCE for detect_bos_choch - no
+# minimum break-distance filter existed before this parameter, so 0.0 (off) is a
+# placeholder for making the assumption visible/configurable, not a chosen value.
+DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE = 0.0
+
+
+def detect_trendline(
+    window: pd.DataFrame,
+    swings: list[dict[str, Any]],
+    right_bars: int = 3,
+    trendline_points: int = DEFAULT_TRENDLINE_POINTS,
+    min_trendline_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
+) -> dict[str, Any]:
+    """Real diagonal trendlines, replacing classify_swing_trend's 2-swing
+    comparison (removed above - see this function's own module-level note).
+    Fits two independent lines - a **support** line through confirmed swing LOWS
+    (the uptrend line) and a **resistance** line through confirmed swing HIGHS
+    (the downtrend line) - via least-squares over the most recent
+    `trendline_points` confirmed swings of each type (see _fit_line and
+    DEFAULT_TRENDLINE_POINTS above for the exact-math choice and why it subsumes
+    the two-point-line alternative). Bar-by-bar, mirroring detect_bos_choch's
+    structure closely (same confirmation-lag guard, same close-vs-wick discipline):
+
+    1. Any swings newly confirmed as of bar `i` (`swing["index"] + right_bars <=
+       i`, same lag as detect_swings/detect_bos_choch) are appended to a running,
+       type-specific point list (`low_points` / `high_points`, chronological,
+       never reset - see below). Once a type has at least `trendline_points`
+       confirmed swings, the line for that type is (re)fit from the most recent
+       `trendline_points` of them.
+    2. The *current* fitted line (if any) is projected to bar `i`'s x-position
+       (`slope * i + intercept`) and compared against `close` - **close, not the
+       bar's high/low**, the same discipline detect_bos_choch's close-crossing
+       phase uses, deliberately not "any wick touch breaks it."
+       - Support line: `close < projected - min_trendline_break_distance` fires a
+         `SUPPORT_BREAK` (`direction: "bearish"` - price broke down through the
+         uptrend line) and invalidates the line (support_line = None) until
+         enough new lows accumulate to refit.
+       - Resistance line: `close > projected + min_trendline_break_distance`
+         fires a `RESISTANCE_BREAK` (`direction: "bullish"`) and invalidates the
+         line the same way.
+       - These are two **independent** checks (not if/elif like
+         detect_bos_choch's single pending_high/pending_low) since they concern
+         two unrelated lines - both could in principle fire on the same bar.
+
+    Deliberately **not** carried over from detect_bos_choch: there is no
+    wick-based "supersession" phase (the mechanism that lets a newly-confirmed
+    swing itself already being past the pending level fire an event even without
+    a close-crossing). A continuous fitted line doesn't have a clean equivalent
+    of "the new swing is already past the old level" - the projected line value
+    changes continuously, not at discrete swing-confirmation points - so this is
+    scoped to close-crossing only, a documented choice, not an oversight.
+
+    `low_points`/`high_points` are **never reset** on a break - they keep
+    accumulating every confirmed swing of that type for the life of the window,
+    so the next confirmed swing after a break naturally triggers a refit from
+    whatever's most recent, without needing separate "was there a break" state.
+
+    Returns `{"support": {...} | None, "resistance": {...} | None, "breaks":
+    [...]}`. `support`/`resistance`, when not None, are `{"slope", "intercept",
+    "value_at_last_index"}` describing the line **as it stands at the end of the
+    window** (None if invalidated by a break with nothing yet refit, or if fewer
+    than `trendline_points` confirmed swings of that type ever existed). `breaks`
+    is every SUPPORT_BREAK/RESISTANCE_BREAK event across the whole window,
+    chronological, same shape as detect_bos_choch's events
+    (`type`/`direction`/`price`/`index`/`time`)."""
+    n = len(window)
+    if not swings or n == 0:
+        return {"support": None, "resistance": None, "breaks": []}
+
+    swings_sorted = sorted(swings, key=lambda s: s["index"])
+    swing_ptr = 0
+    low_points: list[tuple[int, float]] = []
+    high_points: list[tuple[int, float]] = []
+    support_line: tuple[float, float] | None = None
+    resistance_line: tuple[float, float] | None = None
+    breaks: list[dict[str, Any]] = []
+
+    closes = window["close"].to_numpy(dtype=float)
+    times = _all_time_strs(window)
+
+    for i in range(n):
+        while swing_ptr < len(swings_sorted) and swings_sorted[swing_ptr]["index"] + right_bars <= i:
+            s = swings_sorted[swing_ptr]
+            if s["type"] == "low":
+                low_points.append((s["index"], s["price"]))
+                if len(low_points) >= trendline_points:
+                    fitted = _fit_line(low_points[-trendline_points:])
+                    if fitted is not None:
+                        support_line = fitted
+            else:
+                high_points.append((s["index"], s["price"]))
+                if len(high_points) >= trendline_points:
+                    fitted = _fit_line(high_points[-trendline_points:])
+                    if fitted is not None:
+                        resistance_line = fitted
+            swing_ptr += 1
+
+        close = closes[i]
+        ts = times[i]
+
+        if support_line is not None:
+            slope, intercept = support_line
+            projected = slope * i + intercept
+            if close < projected - min_trendline_break_distance:
+                breaks.append({
+                    "type": "SUPPORT_BREAK", "direction": "bearish",
+                    "price": float(projected), "index": i, "time": ts,
+                })
+                support_line = None
+
+        if resistance_line is not None:
+            slope, intercept = resistance_line
+            projected = slope * i + intercept
+            if close > projected + min_trendline_break_distance:
+                breaks.append({
+                    "type": "RESISTANCE_BREAK", "direction": "bullish",
+                    "price": float(projected), "index": i, "time": ts,
+                })
+                resistance_line = None
+
+    def _line_dict(line: tuple[float, float] | None) -> dict[str, float] | None:
+        if line is None:
+            return None
+        slope, intercept = line
+        last_index = n - 1
+        return {
+            "slope": float(slope), "intercept": float(intercept),
+            "value_at_last_index": float(slope * last_index + intercept),
+        }
+
+    return {
+        "support": _line_dict(support_line),
+        "resistance": _line_dict(resistance_line),
+        "breaks": breaks,
+    }
 
 
 # TODO: no minimum break-distance filter existed before this parameter was added -
@@ -448,6 +608,8 @@ def compute_smc_features(
     min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
     min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
     min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
+    trendline_points: int = DEFAULT_TRENDLINE_POINTS,
+    min_trendline_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
 ) -> dict[str, Any]:
     """OHLCV DataFrame -> SMC structure feature dict. Pure computation, no
     buy/sell judgment (see signals/smc_aggregator.py for that)."""
@@ -469,11 +631,12 @@ def compute_smc_features(
     order_blocks = detect_order_blocks(window, min_ob_body_ratio=min_ob_body_ratio, atr=atr)
     fvgs = detect_fvg(window, min_fvg_gap_ratio=min_fvg_gap_ratio, atr=atr)
     swings = detect_swings(window, left_bars=swing_left_bars, right_bars=swing_right_bars)
-    lows = [s for s in swings if s["type"] == "low"]
-    highs = [s for s in swings if s["type"] == "high"]
-    swing_trend = classify_swing_trend(lows, highs)
     structure_events = detect_bos_choch(
         window, swings, right_bars=swing_right_bars, min_break_distance=min_break_distance,
+    )
+    trendline = detect_trendline(
+        window, swings, right_bars=swing_right_bars, trendline_points=trendline_points,
+        min_trendline_break_distance=min_trendline_break_distance,
     )
     fakeout = detect_fakeout(window, swings)
 
@@ -482,7 +645,7 @@ def compute_smc_features(
         "order_blocks": order_blocks,
         "fvgs": fvgs,
         "swings": swings,
-        "swing_trend": swing_trend,
+        "trendline": trendline,
         "structure_events": structure_events,
         "structure_bias": structure_events[-1]["direction"] if structure_events else None,
         "fakeout": fakeout,
