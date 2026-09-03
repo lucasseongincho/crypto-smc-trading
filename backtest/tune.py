@@ -1,16 +1,27 @@
 """
 tune.py
-Coarse joint grid search over the four SMC detector-level tuning parameters
-(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio, min_break_distance) against
-real Kraken archive history, plus a strictly separate --evaluate-holdout path for
-a one-time final check against data the search itself never touches.
+Coarse joint grid search over three SMC detector-level tuning parameters
+(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio) against real Kraken archive
+history, plus a strictly separate --evaluate-holdout path for a one-time final check
+against data the search itself never touches.
+
+min_break_distance (detect_bos_choch's close-crossing threshold) is deliberately
+NOT a grid parameter - removed outright, not deprioritized. Confirmed via a direct
+code trace: signals/smc_aggregator.py does not read structure_bias/structure_events
+(BOS/CHoCH's output) anywhere - the 2026-09 rebuild's 5-vote aggregator reads order
+block/FVG/trendline/channel/fakeout_trap only - and backtest/runner.py's
+_structural_stop_loss reads only order_blocks, never structure_bias/structure_events
+either. min_break_distance's entire causal chain terminates at detect_bos_choch's own
+output, which nothing downstream reads. Sweeping it could not have changed a single
+backtest result in this codebase - see docs/tuning-log.md for the same note kept
+alongside the actual results.
 
     python -m backtest.tune
         Runs the full grid search over the tuning period and writes the complete
         result distribution to docs/tuning-log.md.
 
     python -m backtest.tune --evaluate-holdout --min-confluence 3 \
-        --min-ob-body-ratio 0.5 --min-fvg-gap-ratio 0.5 --min-break-distance 50.0
+        --min-ob-body-ratio 0.5 --min-fvg-gap-ratio 0.5
         Runs exactly ONE already-chosen combination against the held-out period and
         appends the result to docs/tuning-log.md. Never invoked by the search path -
         see evaluate_holdout()'s docstring for why.
@@ -34,8 +45,8 @@ stretch, confirm on a disjoint later stretch the search never saw. Anything fanc
 is future work once this baseline separation is trusted and once more archive
 history accumulates.
 
-Why a coarse joint grid, not a fine sweep: with 4 parameters, even 4 values each is
-already 256 backtest runs (see the parallelism note below) - a fine sweep would
+Why a coarse joint grid, not a fine sweep: with 3 parameters, even 4 values each is
+already 64 backtest runs (see the parallelism note below) - a fine sweep would
 multiply that combinatorially for a first pass whose only job is to find whether
 any *region* of this space looks structurally different from all-off, not to
 pinpoint an exact optimum. Fine-tuning around a promising region is legitimate
@@ -44,14 +55,12 @@ be sparse on spot (see the kickoff notes' SMC-on-spot caveat), would mostly just
 fitting this particular window's noise more precisely.
 
 Parallelism: a single backtest run over the ~79,200-candle tuning window takes on
-the order of a minute (data/smc.py's detectors are correctness-first, not
-vectorized - see docs/detector-logic.md; that's a legitimate future optimization
-target, out of scope for building this harness). 256 runs sequentially would take
-hours. run_search() uses ProcessPoolExecutor across all available CPU cores instead
-- each grid point is a fully independent backtest, so this doesn't change any
-result, only wall-clock time. Each worker process loads+slices the snapshot once
-(via an initializer) and reuses it for every point that lands on that worker,
-rather than reloading a ~100MB CSV per grid point.
+the order of a minute. 64 runs sequentially would still take over an hour.
+run_search() uses ProcessPoolExecutor across all available CPU cores instead - each
+grid point is a fully independent backtest, so this doesn't change any result, only
+wall-clock time. Each worker process loads+slices the snapshot once (via an
+initializer) and reuses it for every point that lands on that worker, rather than
+reloading a ~100MB CSV per grid point.
 """
 import argparse
 import itertools
@@ -106,13 +115,13 @@ MIN_FVG_GAP_RATIO_GRID = [0.0, 0.5, 1.0, 2.0]
 # move). 2.0 = double ATR (only unusually large displacement counts). Even steps
 # bracketing "no filter" through "strict".
 
-MIN_BREAK_DISTANCE_GRID = [0.0, 25.0, 50.0, 100.0]
-# Raw price distance in dollars, not an ATR ratio (that's what was specified for
-# this parameter - see data/smc.py). 0.0 = off. 50.0 is not a new arbitrary number:
-# it matches this project's own min_sl_distance default (backtest/risk.py) - the
-# same noise-floor assumption already made elsewhere in this codebase, reused here
-# rather than inventing a second one. 25.0/100.0 bracket that reference point at
-# half and double.
+# min_break_distance (detect_bos_choch's close-crossing threshold) is deliberately
+# NOT swept here - removed outright, not deprioritized. See this module's own
+# docstring for the code-trace confirming it has zero causal path to any backtest
+# output: signals/smc_aggregator.py's 5-vote model never reads structure_bias/
+# structure_events, and backtest/runner.py's stop-loss placement reads only
+# order_blocks. Every backtest run below uses run_backtest()'s own default
+# (DEFAULT_MIN_BREAK_DISTANCE = 0.0) implicitly, since it's never passed through.
 
 
 @dataclass(frozen=True)
@@ -120,7 +129,6 @@ class GridPoint:
     min_confluence: int
     min_ob_body_ratio: float
     min_fvg_gap_ratio: float
-    min_break_distance: float
 
 
 def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) -> dict[str, Any]:
@@ -144,14 +152,12 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
         df, aggregator, risk, FillConfig(),
         min_ob_body_ratio=point.min_ob_body_ratio,
         min_fvg_gap_ratio=point.min_fvg_gap_ratio,
-        min_break_distance=point.min_break_distance,
         allow_short=allow_short,
     )
     return {
         "min_confluence": point.min_confluence,
         "min_ob_body_ratio": point.min_ob_body_ratio,
         "min_fvg_gap_ratio": point.min_fvg_gap_ratio,
-        "min_break_distance": point.min_break_distance,
         # Always computed (cheap, harmless when allow_short=False - short_trades
         # is just always 0 then) so the long+short diagnostic can report the split
         # without a separate code path.
@@ -180,9 +186,9 @@ def _run_point_in_worker(point: GridPoint) -> dict[str, Any]:
 
 def build_grid() -> list[GridPoint]:
     return [
-        GridPoint(c, ob, fvg, brk)
-        for c, ob, fvg, brk in itertools.product(
-            MIN_CONFLUENCE_GRID, MIN_OB_BODY_RATIO_GRID, MIN_FVG_GAP_RATIO_GRID, MIN_BREAK_DISTANCE_GRID,
+        GridPoint(c, ob, fvg)
+        for c, ob, fvg in itertools.product(
+            MIN_CONFLUENCE_GRID, MIN_OB_BODY_RATIO_GRID, MIN_FVG_GAP_RATIO_GRID,
         )
     ]
 
@@ -220,7 +226,7 @@ def run_search(
             print(
                 f"[{i:>3}/{len(grid)}] {elapsed:6.1f}s  "
                 f"conf={row['min_confluence']} ob={row['min_ob_body_ratio']} "
-                f"fvg={row['min_fvg_gap_ratio']} brk={row['min_break_distance']:<5} "
+                f"fvg={row['min_fvg_gap_ratio']} "
                 f"-> trades={row['total_trades']:>4} roi={row['roi_pct']:>7.2f}% "
                 f"pf={row['profit_factor']:.2f}"
             )
@@ -265,7 +271,6 @@ def evaluate_holdout(
     min_confluence: int,
     min_ob_body_ratio: float,
     min_fvg_gap_ratio: float,
-    min_break_distance: float,
     snapshot_path: Path = DEFAULT_SNAPSHOT,
     start: str = HOLDOUT_START,
     end: str = HOLDOUT_END,
@@ -279,7 +284,7 @@ def evaluate_holdout(
     of keeping it separate.
     """
     df = load_snapshot(snapshot_path).loc[start:end]
-    point = GridPoint(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio, min_break_distance)
+    point = GridPoint(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio)
     return _run_point(point, df)
 
 
@@ -306,7 +311,7 @@ def _format_row(row: dict[str, Any]) -> str:
     flag = "†" if row["total_trades"] < LOW_SAMPLE_TRADE_THRESHOLD else " "
     return (
         f"| {row['min_confluence']} | {row['min_ob_body_ratio']:.2f} | {row['min_fvg_gap_ratio']:.2f} | "
-        f"{row['min_break_distance']:.1f} | {_metric_cells(row)} | {flag} |"
+        f"{_metric_cells(row)} | {flag} |"
     )
 
 
@@ -323,8 +328,16 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
         "## Grid search results",
         "",
         f"Tuning period: **{start} -> {end}** ({TUNING_START} - {TUNING_END} by default). "
-        f"{len(results)} combinations, sorted by ROI (highest first) - full distribution, not a top-N cut.",
+        f"{len(results)} combinations, sorted by ROI (highest first) - full distribution, not a top-N cut. "
+        "Swept: `min_confluence`, `min_ob_body_ratio`, `min_fvg_gap_ratio`.",
         "",
+        "- **`min_break_distance` is deliberately excluded from this grid - not deprioritized, removed.** "
+        "It gates `detect_bos_choch`'s close-crossing threshold, and a direct code trace confirms that "
+        "detector's output (`structure_bias`/`structure_events`) has no causal path to any backtest "
+        "result: `signals/smc_aggregator.py`'s 5-vote model (order block/FVG/trendline/channel/"
+        "fakeout_trap) never reads it, and `backtest/runner.py`'s stop-loss placement reads only "
+        "`order_blocks`. Sweeping it could not have changed a single result in this table - every "
+        "combination below implicitly ran with `min_break_distance` at its unswept default (`0.0`).",
         f"- Combinations with fewer than {LOW_SAMPLE_TRADE_THRESHOLD} trades are flagged `†` and should be read "
         "as low-sample, not as a genuine result - a handful of trades over 9 months of a sparse-signal "
         "strategy is not enough to distinguish structure from chance.",
@@ -332,8 +345,8 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
         f"- Trade count across the grid: min {min(trade_counts)}, median {statistics.median(trade_counts):.0f}, "
         f"max {max(trade_counts)}.",
         "",
-        f"| Conf | OB ratio | FVG ratio | Break $ | {header_cells} | † |",
-        f"|---|---|---|---|{sep_cells}|---|",
+        f"| Conf | OB ratio | FVG ratio | {header_cells} | † |",
+        f"|---|---|---|{sep_cells}|---|",
     ]
     lines.extend(_format_row(row) for row in ranked)
     lines.append("")
@@ -390,7 +403,7 @@ def write_tuning_log(results: list[dict[str, Any]], start: str, end: str, path: 
 def _diagnostic_short_section_text(
     long_only: list[dict[str, Any]], long_short: list[dict[str, Any]], start: str, end: str,
 ) -> str:
-    key = lambda r: (r["min_confluence"], r["min_ob_body_ratio"], r["min_fvg_gap_ratio"], r["min_break_distance"])
+    key = lambda r: (r["min_confluence"], r["min_ob_body_ratio"], r["min_fvg_gap_ratio"])
     by_long_only = {key(r): r for r in long_only}
     by_long_short = {key(r): r for r in long_short}
     paired_keys = sorted(by_long_only.keys() & by_long_short.keys())
@@ -422,15 +435,15 @@ def _diagnostic_short_section_text(
         f"combinations: {statistics.median(roi_deltas):+.2f} points",
         f"- Combinations where long+short beat long-only: {sum(1 for d in roi_deltas if d > 0)}/{len(paired_keys)}",
         "",
-        "| Conf | OB ratio | FVG ratio | Break $ | Long-only ROI% | Long+short ROI% | Δ ROI (pts) | "
+        "| Conf | OB ratio | FVG ratio | Long-only ROI% | Long+short ROI% | Δ ROI (pts) | "
         "Long+short trades (long/short) |",
-        "|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|",
     ]
     for k in sorted(paired_keys, key=lambda k: by_long_short[k]["roi_pct"] - by_long_only[k]["roi_pct"], reverse=True):
         lo, ls = by_long_only[k], by_long_short[k]
         delta = ls["roi_pct"] - lo["roi_pct"]
         lines.append(
-            f"| {k[0]} | {k[1]:.2f} | {k[2]:.2f} | {k[3]:.1f} | {lo['roi_pct']:.2f} | {ls['roi_pct']:.2f} | "
+            f"| {k[0]} | {k[1]:.2f} | {k[2]:.2f} | {lo['roi_pct']:.2f} | {ls['roi_pct']:.2f} | "
             f"{delta:+.2f} | {ls['total_trades']} ({ls['long_trades']}/{ls['short_trades']}) |"
         )
     return "\n".join(lines)
@@ -482,7 +495,7 @@ def append_holdout_result(row: dict[str, Any], start: str, end: str, path: Path 
     entry = (
         f"\n### {timestamp}\n\n"
         f"Params: `min_confluence={row['min_confluence']}`, `min_ob_body_ratio={row['min_ob_body_ratio']}`, "
-        f"`min_fvg_gap_ratio={row['min_fvg_gap_ratio']}`, `min_break_distance={row['min_break_distance']}`. "
+        f"`min_fvg_gap_ratio={row['min_fvg_gap_ratio']}`. "
         f"Evaluated on {start} -> {end}.\n\n"
         f"| {header_cells} |\n|{sep_cells}|\n"
         f"| {_metric_cells(row)} |\n"  # metric cells only - params already stated in the prose above
@@ -500,7 +513,7 @@ def main() -> None:
     parser.add_argument(
         "--evaluate-holdout", action="store_true",
         help="Run ONE combination against the held-out period instead of the grid search. "
-             "Requires --min-confluence/--min-ob-body-ratio/--min-fvg-gap-ratio/--min-break-distance.",
+             "Requires --min-confluence/--min-ob-body-ratio/--min-fvg-gap-ratio.",
     )
     parser.add_argument(
         "--diagnostic-allow-short", action="store_true",
@@ -512,14 +525,13 @@ def main() -> None:
     parser.add_argument("--min-confluence", type=int)
     parser.add_argument("--min-ob-body-ratio", type=float)
     parser.add_argument("--min-fvg-gap-ratio", type=float)
-    parser.add_argument("--min-break-distance", type=float)
     args = parser.parse_args()
 
     if args.evaluate_holdout:
         missing = [
             name for name, val in [
                 ("--min-confluence", args.min_confluence), ("--min-ob-body-ratio", args.min_ob_body_ratio),
-                ("--min-fvg-gap-ratio", args.min_fvg_gap_ratio), ("--min-break-distance", args.min_break_distance),
+                ("--min-fvg-gap-ratio", args.min_fvg_gap_ratio),
             ] if val is None
         ]
         if missing:
@@ -530,7 +542,7 @@ def main() -> None:
             "this is a deliberate one-time check, not part of the search."
         )
         row = evaluate_holdout(
-            args.min_confluence, args.min_ob_body_ratio, args.min_fvg_gap_ratio, args.min_break_distance,
+            args.min_confluence, args.min_ob_body_ratio, args.min_fvg_gap_ratio,
             snapshot_path=args.snapshot,
         )
         for key, label, fmt in _METRIC_COLUMNS:

@@ -11,7 +11,6 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 
 from backtest.tune import (
-    MIN_BREAK_DISTANCE_GRID,
     MIN_CONFLUENCE_GRID,
     MIN_FVG_GAP_RATIO_GRID,
     MIN_OB_BODY_RATIO_GRID,
@@ -38,18 +37,15 @@ def _synthetic_ohlc(n: int = 60) -> pd.DataFrame:
 
 
 class TestBuildGrid(unittest.TestCase):
-    def test_grid_size_matches_the_product_of_all_four_parameter_lists(self):
+    def test_grid_size_matches_the_product_of_all_three_parameter_lists(self):
         grid = build_grid()
-        expected = (
-            len(MIN_CONFLUENCE_GRID) * len(MIN_OB_BODY_RATIO_GRID)
-            * len(MIN_FVG_GAP_RATIO_GRID) * len(MIN_BREAK_DISTANCE_GRID)
-        )
+        expected = len(MIN_CONFLUENCE_GRID) * len(MIN_OB_BODY_RATIO_GRID) * len(MIN_FVG_GAP_RATIO_GRID)
         self.assertEqual(len(grid), expected)
-        self.assertEqual(len(grid), 256)  # 4 values each, as specified
+        self.assertEqual(len(grid), 64)  # 4 values each, as specified
 
     def test_grid_has_no_duplicate_points(self):
         grid = build_grid()
-        as_tuples = {(p.min_confluence, p.min_ob_body_ratio, p.min_fvg_gap_ratio, p.min_break_distance) for p in grid}
+        as_tuples = {(p.min_confluence, p.min_ob_body_ratio, p.min_fvg_gap_ratio) for p in grid}
         self.assertEqual(len(as_tuples), len(grid))
 
     def test_every_grid_value_is_within_its_declared_list(self):
@@ -58,32 +54,39 @@ class TestBuildGrid(unittest.TestCase):
             self.assertIn(p.min_confluence, MIN_CONFLUENCE_GRID)
             self.assertIn(p.min_ob_body_ratio, MIN_OB_BODY_RATIO_GRID)
             self.assertIn(p.min_fvg_gap_ratio, MIN_FVG_GAP_RATIO_GRID)
-            self.assertIn(p.min_break_distance, MIN_BREAK_DISTANCE_GRID)
+
+    def test_min_break_distance_is_not_a_grid_field(self):
+        # Removed outright, not deprioritized - see backtest/tune.py's module
+        # docstring for the code-trace confirming it has no causal path to any
+        # backtest output (signals/smc_aggregator.py never reads structure_bias/
+        # structure_events, backtest/runner.py's stop-loss reads only order_blocks).
+        self.assertNotIn("min_break_distance", GridPoint.__dataclass_fields__)
 
 
 class TestRunPoint(unittest.TestCase):
     def test_returns_params_and_full_trade_level_metrics(self):
         df = _synthetic_ohlc()
-        point = GridPoint(min_confluence=1, min_ob_body_ratio=0.0, min_fvg_gap_ratio=0.0, min_break_distance=0.0)
+        point = GridPoint(min_confluence=1, min_ob_body_ratio=0.0, min_fvg_gap_ratio=0.0)
 
         row = _run_point(point, df)
 
         self.assertEqual(row["min_confluence"], 1)
         self.assertEqual(row["min_ob_body_ratio"], 0.0)
+        self.assertNotIn("min_break_distance", row)
         for key in ["total_trades", "win_rate_pct", "profit_factor", "roi_pct", "avg_r_multiple", "median_r_multiple"]:
             self.assertIn(key, row)
 
     def test_stricter_confluence_never_produces_more_trades_than_looser_on_the_same_data(self):
         df = _synthetic_ohlc(n=90)
-        loose = _run_point(GridPoint(1, 0.0, 0.0, 0.0), df)
-        strict = _run_point(GridPoint(4, 0.0, 0.0, 0.0), df)
+        loose = _run_point(GridPoint(1, 0.0, 0.0), df)
+        strict = _run_point(GridPoint(4, 0.0, 0.0), df)
         self.assertLessEqual(strict["total_trades"], loose["total_trades"])
 
 
 class TestWriteTuningLog(unittest.TestCase):
     def test_writes_a_markdown_table_with_every_result_row(self):
         results = [
-            {"min_confluence": c, "min_ob_body_ratio": 0.0, "min_fvg_gap_ratio": 0.0, "min_break_distance": 0.0,
+            {"min_confluence": c, "min_ob_body_ratio": 0.0, "min_fvg_gap_ratio": 0.0,
              "total_trades": 5, "win_rate_pct": 40.0, "profit_factor": 1.2, "total_pnl": 100.0, "roi_pct": 0.5,
              "max_drawdown_pct": 2.0, "avg_r_multiple": 0.3, "median_r_multiple": 0.2, "std_r_multiple": 0.1,
              "buy_hold_return_pct": 1.0}
@@ -102,7 +105,7 @@ class TestWriteTuningLog(unittest.TestCase):
 
     def test_low_sample_rows_are_flagged(self):
         results = [
-            {"min_confluence": 4, "min_ob_body_ratio": 2.0, "min_fvg_gap_ratio": 2.0, "min_break_distance": 100.0,
+            {"min_confluence": 4, "min_ob_body_ratio": 2.0, "min_fvg_gap_ratio": 2.0,
              "total_trades": 2, "win_rate_pct": 0.0, "profit_factor": 0.0, "total_pnl": 0.0, "roi_pct": 0.0,
              "max_drawdown_pct": 0.0, "avg_r_multiple": 0.0, "median_r_multiple": 0.0, "std_r_multiple": 0.0,
              "buy_hold_return_pct": None},
@@ -115,7 +118,7 @@ class TestWriteTuningLog(unittest.TestCase):
         self.assertIn("†", content)
 
     def test_rerunning_the_search_preserves_an_existing_holdout_section(self):
-        row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5, "min_break_distance": 50.0,
+        row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5,
                "total_trades": 12, "win_rate_pct": 50.0, "profit_factor": 1.5, "total_pnl": 200.0, "roi_pct": 1.0,
                "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4, "median_r_multiple": 0.3, "std_r_multiple": 0.2,
                "buy_hold_return_pct": 2.0}
@@ -136,7 +139,7 @@ class TestWriteTuningLog(unittest.TestCase):
 
 
 def _sample_row(**overrides) -> dict:
-    row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5, "min_break_distance": 50.0,
+    row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5,
            "total_trades": 12, "long_trades": 12, "short_trades": 0, "win_rate_pct": 50.0, "profit_factor": 1.5,
            "total_pnl": 200.0, "roi_pct": 1.0, "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4,
            "median_r_multiple": 0.3, "std_r_multiple": 0.2, "buy_hold_return_pct": 2.0}
@@ -209,7 +212,7 @@ class TestDiagnosticShortSectionOrderingIsPreservedBothWays(unittest.TestCase):
 
 class TestAppendHoldoutResult(unittest.TestCase):
     def test_creates_the_file_and_section_if_neither_exists(self):
-        row = {"min_confluence": 2, "min_ob_body_ratio": 1.0, "min_fvg_gap_ratio": 1.0, "min_break_distance": 25.0,
+        row = {"min_confluence": 2, "min_ob_body_ratio": 1.0, "min_fvg_gap_ratio": 1.0,
                "total_trades": 8, "win_rate_pct": 37.5, "profit_factor": 0.9, "total_pnl": -50.0, "roi_pct": -0.25,
                "max_drawdown_pct": 1.5, "avg_r_multiple": -0.1, "median_r_multiple": -0.05, "std_r_multiple": 0.3,
                "buy_hold_return_pct": 0.4}
@@ -228,7 +231,7 @@ class TestAppendHoldoutResult(unittest.TestCase):
         self.assertIn("| 8 | 37.5 | 0.90 | -50 | -0.25 | 1.50 | -0.10 | -0.05 | 0.30 |", content)
 
     def test_appending_twice_keeps_both_entries(self):
-        row = {"min_confluence": 2, "min_ob_body_ratio": 1.0, "min_fvg_gap_ratio": 1.0, "min_break_distance": 25.0,
+        row = {"min_confluence": 2, "min_ob_body_ratio": 1.0, "min_fvg_gap_ratio": 1.0,
                "total_trades": 8, "win_rate_pct": 37.5, "profit_factor": 0.9, "total_pnl": -50.0, "roi_pct": -0.25,
                "max_drawdown_pct": 1.5, "avg_r_multiple": -0.1, "median_r_multiple": -0.05, "std_r_multiple": 0.3,
                "buy_hold_return_pct": 0.4}
