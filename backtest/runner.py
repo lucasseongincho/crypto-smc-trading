@@ -17,6 +17,7 @@ stop-loss and take-profit, OHLC data alone can't say which happened first. This
 simulator always resolves that in the stop-loss's favor (checks SL before TP) - the
 conservative assumption, not an attempt to guess intrabar sequencing.
 """
+import statistics
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -24,7 +25,13 @@ from typing import Any, Callable
 import pandas as pd
 
 from backtest.risk import RiskManager
-from data.smc import DEFAULT_LOOKBACK_BARS, compute_smc_features
+from data.smc import (
+    DEFAULT_LOOKBACK_BARS,
+    DEFAULT_MIN_BREAK_DISTANCE,
+    DEFAULT_MIN_FVG_GAP_RATIO,
+    DEFAULT_MIN_OB_BODY_RATIO,
+    compute_smc_features,
+)
 from signals.smc_aggregator import SMCSignal, SMCSignalAggregator
 
 
@@ -87,6 +94,8 @@ class BacktestResult:
             start, end = self.buy_hold_curve[0]["balance"], self.buy_hold_curve[-1]["balance"]
             buy_hold_return_pct = (end - start) / start * 100 if start else None
 
+        r_multiples = [t.r_multiple for t in self.trades]
+
         return {
             "total_trades": n,
             "win_rate_pct": (len(wins) / n * 100) if n else 0.0,
@@ -95,7 +104,12 @@ class BacktestResult:
             "roi_pct": (self.final_balance - self.initial_balance) / self.initial_balance * 100
             if self.initial_balance else 0.0,
             "max_drawdown_pct": max_dd * 100,
-            "avg_r_multiple": (sum(t.r_multiple for t in self.trades) / n) if n else 0.0,
+            "avg_r_multiple": (sum(r_multiples) / n) if n else 0.0,
+            # Median/stdev alongside the mean: a handful of outlier trades can make
+            # avg_r_multiple look good (or bad) on a small sample - useful signal
+            # when scanning many parameter combinations, not just reporting one.
+            "median_r_multiple": statistics.median(r_multiples) if n else 0.0,
+            "std_r_multiple": statistics.pstdev(r_multiples) if n >= 2 else 0.0,
             "buy_hold_return_pct": buy_hold_return_pct,
         }
 
@@ -151,11 +165,17 @@ class FillEngine:
         risk: RiskManager,
         fill_config: FillConfig | None = None,
         lookback_bars: int = DEFAULT_LOOKBACK_BARS,
+        min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
+        min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
+        min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
     ):
         self.aggregator = aggregator
         self.risk = risk
         self.fill_config = fill_config or FillConfig()
         self.lookback_bars = lookback_bars
+        self.min_ob_body_ratio = min_ob_body_ratio
+        self.min_fvg_gap_ratio = min_fvg_gap_ratio
+        self.min_break_distance = min_break_distance
 
         self._window: deque[tuple[Any, float, float, float, float]] = deque(maxlen=lookback_bars)
         self.position: Position | None = None
@@ -196,7 +216,11 @@ class FillEngine:
     def _evaluate_signal(self, close: float) -> None:
         if len(self._window) < 2:
             return  # not enough data for any detector to fire yet
-        features = compute_smc_features(self._window_df(), lookback_bars=self.lookback_bars)
+        features = compute_smc_features(
+            self._window_df(), lookback_bars=self.lookback_bars,
+            min_ob_body_ratio=self.min_ob_body_ratio, min_fvg_gap_ratio=self.min_fvg_gap_ratio,
+            min_break_distance=self.min_break_distance,
+        )
         signal = self.aggregator.aggregate(features)
         if signal.direction == "BULLISH":
             self._pending_side = "BUY"
@@ -271,12 +295,19 @@ def run_backtest(
     risk: RiskManager,
     fill_config: FillConfig | None = None,
     lookback_bars: int = DEFAULT_LOOKBACK_BARS,
+    min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
+    min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
+    min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     progress_every: int = 200,
 ) -> BacktestResult:
     """Drives FillEngine over a static historical DataFrame."""
     initial_balance = risk.current_balance
-    engine = FillEngine(aggregator, risk, fill_config, lookback_bars)
+    engine = FillEngine(
+        aggregator, risk, fill_config, lookback_bars,
+        min_ob_body_ratio=min_ob_body_ratio, min_fvg_gap_ratio=min_fvg_gap_ratio,
+        min_break_distance=min_break_distance,
+    )
     n = len(df)
 
     for i, row in enumerate(df.itertuples()):

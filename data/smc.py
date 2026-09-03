@@ -16,11 +16,29 @@ import pandas as pd
 
 
 def _time_str(window: pd.DataFrame, i: int) -> str | None:
-    """window.index[i] -> ISO timestamp string, or None if the index isn't datetime-like."""
+    """window.index[i] -> ISO timestamp string, or None if the index isn't datetime-like.
+    Used directly only by detect_fakeout(), which only ever needs one index (O(1),
+    no benefit from precomputing). The O(n) loops below use _all_time_strs()
+    instead - same per-element try/except as this function, just computed once up
+    front rather than re-deriving pd.Timestamp(window.index[i]) on every iteration."""
     try:
         return pd.Timestamp(window.index[i]).isoformat()
     except Exception:
         return None
+
+
+def _all_time_strs(window: pd.DataFrame) -> list[str | None]:
+    """Equivalent to [_time_str(window, i) for i in range(len(window))], computed
+    in one pass over window.index rather than by repeated positional index access -
+    the O(n) detectors below call this once and index into the result, instead of
+    each iteration re-doing pd.Timestamp(window.index[i]).isoformat()."""
+    result: list[str | None] = []
+    for t in window.index:
+        try:
+            result.append(pd.Timestamp(t).isoformat())
+        except Exception:
+            result.append(None)
+    return result
 
 
 def _atr(window: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -52,6 +70,7 @@ DEFAULT_MIN_OB_BODY_RATIO = 0.0
 def detect_order_blocks(
     window: pd.DataFrame,
     min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
+    atr: pd.Series | None = None,
 ) -> list[dict[str, Any]]:
     """Order Block: a candle that gets strongly overrun (engulfed) by the next candle
     in the opposite direction, with a body at least min_ob_body_ratio * ATR(14) -
@@ -60,32 +79,51 @@ def detect_order_blocks(
     backtest/risk.py's absolute-dollar min_sl_distance being flagged for
     re-validation, just solved with a ratio here instead). Still no BOS/CHoCH gating
     or mitigation tracking - see docs/detector-logic.md for why that's a separate,
-    unaddressed gap from this size filter."""
+    unaddressed gap from this size filter.
+
+    atr: precomputed _atr(window), or None to compute it here. compute_smc_features
+    passes its own precomputed value in, since detect_fvg needs the identical ATR
+    series over the same window and recomputing it twice was, empirically, over
+    half this function's runtime for no benefit - the value is identical either way
+    (same window, same _atr() code path), this just avoids paying for it twice."""
     ob_list: list[dict[str, Any]] = []
-    if len(window) < 2:
+    n = len(window)
+    if n < 2:
         return ob_list
 
-    atr = _atr(window)
+    # Same per-pair comparisons as before, just read from numpy arrays instead of
+    # window.iloc[i]["field"] - pandas positional/label access has real per-call
+    # overhead that dominated this loop's runtime; plain array indexing reads the
+    # exact same underlying float64 values with no arithmetic involved, so this is
+    # a data-access change only, not an algorithm change (see docs/detector-logic.md
+    # and tests/test_smc_vectorization_equivalence.py for the verification this
+    # claim is checked against, not just asserted).
+    opens = window["open"].to_numpy(dtype=float)
+    highs = window["high"].to_numpy(dtype=float)
+    lows = window["low"].to_numpy(dtype=float)
+    closes = window["close"].to_numpy(dtype=float)
+    atr_arr = (atr if atr is not None else _atr(window)).to_numpy(dtype=float)
+    times = _all_time_strs(window)
 
-    for i in range(1, len(window)):
-        prev = window.iloc[i - 1]
-        curr = window.iloc[i]
-        ts = _time_str(window, i)
+    for i in range(1, n):
+        prev_open, prev_high, prev_low, prev_close = opens[i - 1], highs[i - 1], lows[i - 1], closes[i - 1]
+        curr_open, curr_close = opens[i], closes[i]
+        ts = times[i]
 
-        prev_body = abs(float(prev["close"]) - float(prev["open"]))
-        if prev_body < min_ob_body_ratio * float(atr.iloc[i - 1]):
+        prev_body = abs(prev_close - prev_open)
+        if prev_body < min_ob_body_ratio * atr_arr[i - 1]:
             continue  # candle too small relative to recent volatility to count as an OB
 
-        if float(prev["close"]) < float(prev["open"]) and float(curr["close"]) > float(curr["open"]):
-            if float(curr["close"]) > float(prev["high"]):
+        if prev_close < prev_open and curr_close > curr_open:
+            if curr_close > prev_high:
                 ob_list.append({
-                    "type": "bullish", "high": float(prev["high"]), "low": float(prev["low"]),
+                    "type": "bullish", "high": float(prev_high), "low": float(prev_low),
                     "index": i, "time": ts,
                 })
-        elif float(prev["close"]) > float(prev["open"]) and float(curr["close"]) < float(curr["open"]):
-            if float(curr["close"]) < float(prev["low"]):
+        elif prev_close > prev_open and curr_close < curr_open:
+            if curr_close < prev_low:
                 ob_list.append({
-                    "type": "bearish", "high": float(prev["high"]), "low": float(prev["low"]),
+                    "type": "bearish", "high": float(prev_high), "low": float(prev_low),
                     "index": i, "time": ts,
                 })
 
@@ -104,6 +142,7 @@ DEFAULT_MIN_FVG_GAP_RATIO = 0.0
 def detect_fvg(
     window: pd.DataFrame,
     min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
+    atr: pd.Series | None = None,
 ) -> list[dict[str, Any]]:
     """Fair Value Gap: a 3-candle price gap where the middle candle's range is
     skipped, with a gap at least min_fvg_gap_ratio * ATR(14) - a ratio for the same
@@ -111,31 +150,39 @@ def detect_fvg(
     much for a fixed dollar minimum to stay meaningful). The ATR reference point is
     candle_1's position (i-2), not candle_3's - deliberately excludes the
     gap-forming candles themselves from the volatility baseline used to judge
-    whether the gap they form is significant."""
+    whether the gap they form is significant.
+
+    atr: precomputed _atr(window), or None to compute it here - see
+    detect_order_blocks' docstring for why compute_smc_features passes one in
+    (the same value either way, just computed once instead of twice)."""
     fvg_list: list[dict[str, Any]] = []
-    if len(window) < 3:
+    n = len(window)
+    if n < 3:
         return fvg_list
 
-    atr = _atr(window)
+    highs = window["high"].to_numpy(dtype=float)
+    lows = window["low"].to_numpy(dtype=float)
+    atr_arr = (atr if atr is not None else _atr(window)).to_numpy(dtype=float)
+    times = _all_time_strs(window)
 
-    for i in range(2, len(window)):
-        candle_1 = window.iloc[i - 2]
-        candle_3 = window.iloc[i]
-        ts = _time_str(window, i)
-        min_gap = min_fvg_gap_ratio * float(atr.iloc[i - 2])
+    for i in range(2, n):
+        c1_high, c1_low = highs[i - 2], lows[i - 2]
+        c3_high, c3_low = highs[i], lows[i]
+        ts = times[i]
+        min_gap = min_fvg_gap_ratio * atr_arr[i - 2]
 
-        if float(candle_3["low"]) > float(candle_1["high"]):
-            gap = float(candle_3["low"]) - float(candle_1["high"])
+        if c3_low > c1_high:
+            gap = c3_low - c1_high
             if gap >= min_gap:
                 fvg_list.append({
-                    "type": "bullish", "top": float(candle_3["low"]), "bottom": float(candle_1["high"]),
+                    "type": "bullish", "top": float(c3_low), "bottom": float(c1_high),
                     "index": i, "time": ts,
                 })
-        elif float(candle_3["high"]) < float(candle_1["low"]):
-            gap = float(candle_1["low"]) - float(candle_3["high"])
+        elif c3_high < c1_low:
+            gap = c1_low - c3_high
             if gap >= min_gap:
                 fvg_list.append({
-                    "type": "bearish", "top": float(candle_1["low"]), "bottom": float(candle_3["high"]),
+                    "type": "bearish", "top": float(c1_low), "bottom": float(c3_high),
                     "index": i, "time": ts,
                 })
 
@@ -147,38 +194,44 @@ def detect_swings(window: pd.DataFrame, left_bars: int = 3, right_bars: int = 3)
     until right_bars candles later - detect_bos_choch() accounts for that lag to avoid
     look-ahead bias."""
     swings: list[dict[str, Any]] = []
-    if len(window) < left_bars + right_bars + 1:
+    n = len(window)
+    if n < left_bars + right_bars + 1:
         return swings
 
-    for i in range(left_bars, len(window) - right_bars):
-        curr = window.iloc[i]
-        ts = _time_str(window, i)
+    highs = window["high"].to_numpy(dtype=float)
+    lows = window["low"].to_numpy(dtype=float)
+    times = _all_time_strs(window)
+
+    for i in range(left_bars, n - right_bars):
+        curr_high = highs[i]
+        curr_low = lows[i]
+        ts = times[i]
 
         is_high = True
         for j in range(1, left_bars + 1):
-            if float(window.iloc[i - j]["high"]) >= float(curr["high"]):
+            if highs[i - j] >= curr_high:
                 is_high = False
                 break
         if is_high:
             for j in range(1, right_bars + 1):
-                if float(window.iloc[i + j]["high"]) >= float(curr["high"]):
+                if highs[i + j] >= curr_high:
                     is_high = False
                     break
         if is_high:
-            swings.append({"type": "high", "price": float(curr["high"]), "index": i, "time": ts})
+            swings.append({"type": "high", "price": float(curr_high), "index": i, "time": ts})
 
         is_low = True
         for j in range(1, left_bars + 1):
-            if float(window.iloc[i - j]["low"]) <= float(curr["low"]):
+            if lows[i - j] <= curr_low:
                 is_low = False
                 break
         if is_low:
             for j in range(1, right_bars + 1):
-                if float(window.iloc[i + j]["low"]) <= float(curr["low"]):
+                if lows[i + j] <= curr_low:
                     is_low = False
                     break
         if is_low:
-            swings.append({"type": "low", "price": float(curr["low"]), "index": i, "time": ts})
+            swings.append({"type": "low", "price": float(curr_low), "index": i, "time": ts})
 
     return swings
 
@@ -258,6 +311,9 @@ def detect_bos_choch(
     pending_low: dict[str, Any] | None = None
     bias: str | None = None
 
+    closes = window["close"].to_numpy(dtype=float)
+    times = _all_time_strs(window)
+
     for i in range(len(window)):
         while swing_ptr < len(swings_sorted) and swings_sorted[swing_ptr]["index"] + right_bars <= i:
             s = swings_sorted[swing_ptr]
@@ -281,8 +337,8 @@ def detect_bos_choch(
                 pending_low = s
             swing_ptr += 1
 
-        close = float(window.iloc[i]["close"])
-        ts = _time_str(window, i)
+        close = closes[i]
+        ts = times[i]
 
         if pending_high is not None and close > pending_high["price"] + min_break_distance:
             event_type = "BOS" if bias == "bullish" else "CHoCH"
@@ -359,8 +415,12 @@ def compute_smc_features(
 
     window = df.tail(lookback_bars)
 
-    order_blocks = detect_order_blocks(window, min_ob_body_ratio=min_ob_body_ratio)
-    fvgs = detect_fvg(window, min_fvg_gap_ratio=min_fvg_gap_ratio)
+    # Computed once and shared: detect_order_blocks and detect_fvg both need the
+    # identical ATR series over this same window (see their docstrings) - passing
+    # it in avoids computing it twice for no benefit.
+    atr = _atr(window)
+    order_blocks = detect_order_blocks(window, min_ob_body_ratio=min_ob_body_ratio, atr=atr)
+    fvgs = detect_fvg(window, min_fvg_gap_ratio=min_fvg_gap_ratio, atr=atr)
     swings = detect_swings(window, left_bars=swing_left_bars, right_bars=swing_right_bars)
     lows = [s for s in swings if s["type"] == "low"]
     highs = [s for s in swings if s["type"] == "high"]
