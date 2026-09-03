@@ -215,7 +215,21 @@ just the **direction** of the chronologically last event, whatever its `type`.
 
 ---
 
-## Order block (`detect_order_blocks`, lines 70-130)
+## Order block (`detect_order_blocks`, lines 70-155ish)
+
+**2026-09 redefinition — body-engulf, not close-break-high.** Before this rebuild,
+qualifying as an order block additionally required curr's *close* to break past
+prev's high (bullish) or low (bearish) — a strictly stronger condition than "the
+bodies engulf." This was changed to match the reference video's plain body-engulf
+definition exactly, per the rebuild decision (see
+`../crypto-smc-bot-notes/decisions/2026-09-03-detector-rebuild-decision.md` — outside
+this repo, personal reasoning only, not itself a source of truth for the code).
+**This is a deliberate behavior change, not a bug fix or a refactor** — unlike the
+earlier numpy-vectorization pass, there is no bit-identical guarantee here, and none
+was attempted; correctness is now measured against the video's spec, not against the
+old code's output. `tests/test_smc.py::TestOrderBlockBodyEngulfRedefinition` covers a
+case that qualifies now but didn't before (body engulfs, close never breaks the
+prior wick).
 
 **Literal condition.** `opens`/`highs`/`lows`/`closes` are `window`'s OHLC columns as
 numpy arrays. For each adjacent pair `i` in `1..n-1` (`prev_open, prev_high,
@@ -225,51 +239,91 @@ prev_low, prev_close = opens[i-1], highs[i-1], lows[i-1], closes[i-1]`;
 - First, a size gate: `prev_body = abs(prev_close - prev_open)`; if `prev_body <
   min_ob_body_ratio * atr_arr[i-1]`, `continue` (skip this pair entirely, regardless
   of what the engulf check below would have found). `atr_arr` comes from the `atr`
-  parameter if the caller passed one, else `_atr(window)` computed here (lines
-  44-58, a standard 14-period true-range ATR - unchanged pandas code, see the
-  module-level update note above for why) — the reference point is `atr_arr[i-1]`,
-  i.e. ATR *as of the candle being sized* (`prev`), not incorporating `curr`.
-- Bullish: `prev_close < prev_open` (prev is a down candle) **and** `curr_close >
-  curr_open` (curr is an up candle) **and** `curr_close > prev_high` (curr's close
-  breaks above prev's high). If all three: append `{"type": "bullish", "high":
-  float(prev_high), "low": float(prev_low), ...}` — **the stored zone is `prev`'s
-  high/low, i.e. the down candle itself**, not curr.
-- Bearish: mirror image — `prev_close > prev_open`, `curr_close < curr_open`,
-  `curr_close < prev_low`; zone = `prev`'s high/low.
+  parameter if the caller passed one, else `_atr(window)` computed here, a standard
+  14-period true-range ATR — the reference point is `atr_arr[i-1]`, i.e. ATR *as of
+  the candle being sized* (`prev`), not incorporating `curr`.
+- `_body_engulf_type(prev_open, prev_close, curr_open, curr_close)` — a shared
+  helper, used for both the base single-pair test below and the double-order-block
+  upgrade check further down, so the two patterns can't silently drift apart into
+  two different engulf definitions. Returns `"bullish"` if curr's body
+  `[min(open,close), max(open,close)]` fully wraps prev's body **and** the two
+  candles are opposite colors with prev red/curr green (a support candidate at
+  prev); `"bearish"` for the mirror case (prev green/curr red — a resistance
+  candidate at prev); `None` if the bodies don't fully wrap, or if they're the same
+  color (a same-color "engulf" isn't a reversal pattern and never counts, whatever
+  the body sizes).
+- If `_body_engulf_type` returns non-`None`: append `{"type": engulf_type, "high":
+  float(prev_high), "low": float(prev_low), "index": i, "time": ts, "pattern":
+  "single"}` — **the stored zone is still `prev`'s full wick high/low**, not its
+  body, and not curr — this didn't change in the redefinition, only the engulf test
+  itself did.
 
-This is a plain 2-candle engulfing pattern (now with a size gate), checked
+This is a plain 2-candle body-engulfing pattern (now with a size gate), checked
 independently for every adjacent pair in the window (no deduplication, no "is this
 still the most relevant one").
+
+**Double order block (new).** Not a separate detector or a separate comparison —
+the same `_body_engulf_type` helper, applied one candle further back, upgrading an
+already-found single result rather than producing an independent one. Worked
+example, three consecutive candles A (bearish), B (bullish), C (bearish):
+
+1. The ordinary loop, at `i` pointing at B (`prev=A, curr=B`), finds
+   `_body_engulf_type(A, B) == "bullish"` (B's body engulfs A's) — appends the
+   normal single order block at **A** (support/bullish), exactly as it always has.
+2. The ordinary loop, at `i` pointing at C (`prev=B, curr=C`), finds
+   `_body_engulf_type(B, C) == "bearish"` (C's body engulfs B's) — appends the
+   normal single order block at **B** (resistance/bearish). This step is *not*
+   double-order-block-specific — it's the exact same base test that produced A's
+   entry in step 1, just one pair later.
+3. **The additional check**: while still at `i` pointing at C, also evaluate
+   `_body_engulf_type` one pair further back — `(A, B)` again — via
+   `opens[i-2], closes[i-2], prev_open, prev_close`. Since that's `"bullish"`
+   (computed in step 1) and this pair's own result is `"bearish"` (opposite), the
+   pattern upgrades: append a **second** entry, same zone as B's step-2 entry
+   (B's own high/low), same type (`"bearish"`), but `"pattern": "double"` instead
+   of `"single"`. B ends up with two dict entries in `order_blocks` — its ordinary
+   single result and its double-pattern upgrade — rather than one entry mutated in
+   place; A's entry from step 1 is untouched either way.
+
+So "the middle bullish candle becomes a resistance order block" (B, in the example
+above) is produced by the *same* pair-engulf test that runs for every adjacent pair
+regardless of pattern — nothing above the single-OB logic is a distinct
+"double-order-block detector." The only genuinely new code is the one extra
+`_body_engulf_type` call at step 3, looking one candle further back than the base
+loop already does. `min_ob_body_ratio` applies identically to both — the double
+entry only exists because its underlying single entry (step 2, on B) already
+cleared the size gate; there is no separate/looser gate for the double case. See
+`tests/test_smc.py::TestOrderBlockBodyEngulfRedefinition::test_double_order_block_upgrades_the_middle_candle`.
 
 **Parameters:**
 
 | Param | Default | Status |
 |---|---|---|
-| `min_ob_body_ratio` | `0.0` (`DEFAULT_MIN_OB_BODY_RATIO`, line 67) | **Explicit TODO.** Ratio of `prev`'s candle body to `_atr(window)` at that point — a ratio rather than a raw price threshold, since BTC's price scale drifts too much for a fixed dollar minimum to stay meaningful (same reasoning that flagged `backtest/risk.py`'s absolute-dollar `min_sl_distance` for re-validation; solved with a ratio here instead of a dollar figure). `0.0` reproduces the prior "any body size qualifies" behavior exactly. |
+| `min_ob_body_ratio` | `0.0` (`DEFAULT_MIN_OB_BODY_RATIO`, line 67) | **Explicit TODO.** Ratio of `prev`'s candle body to `_atr(window)` at that point — a ratio rather than a raw price threshold, since BTC's price scale drifts too much for a fixed dollar minimum to stay meaningful (same reasoning that flagged `backtest/risk.py`'s absolute-dollar `min_sl_distance` for re-validation; solved with a ratio here instead of a dollar figure). `0.0` reproduces the prior "any body size qualifies" behavior exactly (against the *old* close-break-high definition — see the redefinition note above for why "prior behavior" no longer means bit-identical here). |
 
 Still **no** minimum range/wick filter, no volume filter, and — as before —
 **no BOS-gating or mitigation tracking at all** (see below).
 
 **Directly answering: is order block validity gated on a subsequent BOS here?**
 **No**, still. `detect_order_blocks(window, min_ob_body_ratio, atr)` has no access to
-`swings` or `structure_events` and is called (line 422) *before* `detect_swings`/
+`swings` or `structure_events` and is called *before* `detect_swings`/
 `detect_bos_choch` even run in `compute_smc_features`. There is no code path,
 anywhere in this repository, that checks "did this order block precede/cause a
 break of structure" before including it in `order_blocks`, before the aggregator
-counts it (`smc_aggregator.py` lines 97-103, which reads only `order_blocks[-1]` —
-the single most recent one, full stop), or before `backtest/runner.py`'s
-`_structural_stop_loss` (lines 124-138) uses it for stop placement (same pattern:
-`order_blocks[-1] if order_blocks else None`, no BOS check, no mitigation check).
-The new size filter changes *which* engulfs qualify, not *how* validity is decided.
+counts it, or before `backtest/runner.py`'s `_structural_stop_loss` uses it for stop
+placement (same pattern: `order_blocks[-1] if order_blocks else None`, no BOS check,
+no mitigation check). The redefinition and the size filter both change *which*
+engulfs qualify, not *how* validity is decided.
 
 > **Divergence from textbook.** Stricter ICT-style definitions typically require an
 > order block to be the last opposite candle *before an impulsive move that breaks
 > structure* — i.e., BOS-gated by construction — and often track whether price has
 > since traded back through the zone ("mitigated") before treating it as still
-> valid. Neither exists here. This implementation flags **any** 2-candle engulf
+> valid. Neither exists here. This implementation flags **any** body-engulf
 > clearing the (currently off) size gate as an order block, valid or not,
-> structurally significant or not, mitigated or not, for as long as it's the most
-> recent one in the lookback window.
+> structurally significant or not, mitigated or not, for as long as it's in the
+> lookback window — the aggregator and stop-placement code then only ever look at
+> the single most recent one (`order_blocks[-1]`), single or double alike.
 
 ---
 

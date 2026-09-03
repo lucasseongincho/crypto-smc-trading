@@ -24,6 +24,17 @@ operation on the same operands in the same order either way. _atr() itself was l
 completely untouched (still pandas rolling().mean()) rather than reimplemented, for
 exactly this reason - a rolling-mean reimplementation risks a different
 floating-point summation order even for a "mathematically equivalent" formula.
+
+**2026-09 scope note:** the 2026-09 detector rebuild (see docs/detector-logic.md and
+../crypto-smc-bot-notes/decisions/2026-09-03-detector-rebuild-decision.md)
+deliberately redefined detect_order_blocks' engulf test (body-engulf, not
+close-break-high) to match a reference video's spec - a real behavior change, not a
+bug fix, so bit-identical equivalence against _ref_detect_order_blocks below no
+longer applies to that one detector. _ref_detect_order_blocks is kept, frozen at the
+pre-rebuild definition, specifically so a canary test can confirm the two
+implementations still genuinely diverge (catching an accidental revert) rather than
+deleting the reference outright. fvgs/swings/BOS-CHoCH are untouched by that rebuild
+and remain checked for exact equivalence as before.
 """
 import random
 import unittest
@@ -212,13 +223,20 @@ class TestVectorizedDetectorsMatchTheFrozenReference(unittest.TestCase):
     def setUp(self):
         self.df = _rich_synthetic_ohlc()
 
-    def test_detect_order_blocks_matches_across_a_spread_of_ratios(self):
-        for ratio in [0.0, 0.25, 0.5, 1.0, 2.0, 5.0]:
-            with self.subTest(ratio=ratio):
-                self.assertEqual(
-                    _ref_detect_order_blocks(self.df, min_ob_body_ratio=ratio),
-                    new.detect_order_blocks(self.df, min_ob_body_ratio=ratio),
-                )
+    def test_detect_order_blocks_deliberately_diverges_from_the_frozen_reference(self):
+        """detect_order_blocks was redefined in the 2026-09 detector rebuild (body-
+        engulf, not close-break-high - see docs/detector-logic.md's "Order block"
+        section and ../crypto-smc-bot-notes/decisions/2026-09-03-detector-rebuild-
+        decision.md). _ref_detect_order_blocks below is frozen at the OLD
+        (pre-rebuild) close-break-high definition, so it is no longer expected to
+        match new.detect_order_blocks - that equivalence assertion was retired on
+        purpose, not silently dropped. This test instead confirms the two
+        implementations genuinely diverge (i.e. the redefinition is actually live,
+        not accidentally reverted to the old behavior) - a canary in the other
+        direction from every other test in this file."""
+        old = _ref_detect_order_blocks(self.df, min_ob_body_ratio=0.5)
+        new_result = new.detect_order_blocks(self.df, min_ob_body_ratio=0.5)
+        self.assertNotEqual(old, new_result)
 
     def test_detect_fvg_matches_across_a_spread_of_ratios(self):
         for ratio in [0.0, 0.25, 0.5, 1.0, 2.0, 5.0]:
@@ -251,8 +269,14 @@ class TestVectorizedDetectorsMatchTheFrozenReference(unittest.TestCase):
         same way the pre-vectorization compute_smc_features assembled them) and
         compares against the live compute_smc_features, catching any integration-
         level drift the per-detector tests above wouldn't (e.g. the shared-ATR
-        wiring introduced alongside the vectorization)."""
-        ref_obs = _ref_detect_order_blocks(self.df, min_ob_body_ratio=0.5)
+        wiring introduced alongside the vectorization).
+
+        order_blocks is deliberately excluded from this comparison - see
+        test_detect_order_blocks_deliberately_diverges_from_the_frozen_reference
+        above; the 2026-09 body-engulf redefinition means the frozen reference is
+        no longer expected to agree with it, on purpose. fvgs/swings/
+        structure_events are untouched by that rebuild phase and still must match
+        exactly."""
         ref_fvgs = _ref_detect_fvg(self.df, min_fvg_gap_ratio=0.5)
         ref_swings = _ref_detect_swings(self.df)
         ref_events = _ref_detect_bos_choch(self.df, ref_swings, min_break_distance=25.0)
@@ -262,7 +286,6 @@ class TestVectorizedDetectorsMatchTheFrozenReference(unittest.TestCase):
             min_ob_body_ratio=0.5, min_fvg_gap_ratio=0.5, min_break_distance=25.0,
         )
 
-        self.assertEqual(actual["order_blocks"], ref_obs)
         self.assertEqual(actual["fvgs"], ref_fvgs)
         self.assertEqual(actual["swings"], ref_swings)
         self.assertEqual(actual["structure_events"], ref_events)

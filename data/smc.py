@@ -67,19 +67,63 @@ def _atr(window: pd.DataFrame, period: int = 14) -> pd.Series:
 DEFAULT_MIN_OB_BODY_RATIO = 0.0
 
 
+def _body_engulf_type(
+    prev_open: float, prev_close: float, curr_open: float, curr_close: float,
+) -> str | None:
+    """Body-engulf test shared by both the single and double order-block patterns
+    below (see the "double order block" section of docs/detector-logic.md for why
+    this is one function, not two): curr's body [min(open,close), max(open,close)]
+    must fully wrap prev's body, AND the two candles must be opposite colors. No
+    close-vs-prior-high/low requirement - see the rebuild decision note this
+    replaces (2026-09, matching the reference video's plain body-engulf definition
+    instead of the old close-break-high test).
+
+    Returns "bullish" (curr green engulfing a red prev - a support/bullish OB
+    candidate at prev) or "bearish" (curr red engulfing a green prev - a
+    resistance/bearish OB candidate at prev), or None if the bodies don't engulf or
+    the candles are the same color (a same-color "engulf" isn't a reversal pattern)."""
+    prev_lo, prev_hi = min(prev_open, prev_close), max(prev_open, prev_close)
+    curr_lo, curr_hi = min(curr_open, curr_close), max(curr_open, curr_close)
+    if not (curr_lo <= prev_lo and curr_hi >= prev_hi):
+        return None
+    if prev_close < prev_open and curr_close > curr_open:
+        return "bullish"
+    if prev_close > prev_open and curr_close < curr_open:
+        return "bearish"
+    return None
+
+
 def detect_order_blocks(
     window: pd.DataFrame,
     min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
     atr: pd.Series | None = None,
 ) -> list[dict[str, Any]]:
-    """Order Block: a candle that gets strongly overrun (engulfed) by the next candle
-    in the opposite direction, with a body at least min_ob_body_ratio * ATR(14) -
-    a ratio rather than a raw price threshold since BTC's price scale drifts too
-    much for a fixed dollar minimum to stay meaningful (same reasoning as
-    backtest/risk.py's absolute-dollar min_sl_distance being flagged for
-    re-validation, just solved with a ratio here instead). Still no BOS/CHoCH gating
-    or mitigation tracking - see docs/detector-logic.md for why that's a separate,
-    unaddressed gap from this size filter.
+    """Order Block: a candle whose body is fully wrapped (engulfed) by the next
+    candle's body, in the opposite direction, with a body at least
+    min_ob_body_ratio * ATR(14) - a ratio rather than a raw price threshold since
+    BTC's price scale drifts too much for a fixed dollar minimum to stay meaningful
+    (same reasoning as backtest/risk.py's absolute-dollar min_sl_distance being
+    flagged for re-validation, just solved with a ratio here instead). Still no
+    BOS/CHoCH gating or mitigation tracking - see docs/detector-logic.md for why
+    that's a separate, unaddressed gap from this size filter.
+
+    Body-engulf, not close-break-high: this is a deliberate redefinition (2026-09)
+    to match the reference video exactly - the prior version additionally required
+    curr's *close* to break past prev's high/low, a stricter condition the video's
+    definition doesn't use. See docs/detector-logic.md's "Order block" section for
+    the full before/after comparison; this is a behavior change, not a bug fix, and
+    is expected to change which candles qualify (no bit-identical guarantee here,
+    unlike the earlier numpy-vectorization pass).
+
+    Double order block: when the just-engulfed candle (the "middle" one) had itself
+    engulfed the *opposite*-direction candle before it, the middle candle is flagged
+    as a stronger ("double") order block on top of - not instead of - the ordinary
+    single order block that pattern already produces at the earlier candle. Reuses
+    _body_engulf_type() for both the single-pair check and the extra look-back
+    check, rather than a separate comparison implementation - see
+    docs/detector-logic.md for the full worked example and why this is "the same
+    pair-engulf result, with an additional check upgrading it," not a distinct
+    detector.
 
     atr: precomputed _atr(window), or None to compute it here. compute_smc_features
     passes its own precomputed value in, since detect_fvg needs the identical ATR
@@ -91,13 +135,6 @@ def detect_order_blocks(
     if n < 2:
         return ob_list
 
-    # Same per-pair comparisons as before, just read from numpy arrays instead of
-    # window.iloc[i]["field"] - pandas positional/label access has real per-call
-    # overhead that dominated this loop's runtime; plain array indexing reads the
-    # exact same underlying float64 values with no arithmetic involved, so this is
-    # a data-access change only, not an algorithm change (see docs/detector-logic.md
-    # and tests/test_smc_vectorization_equivalence.py for the verification this
-    # claim is checked against, not just asserted).
     opens = window["open"].to_numpy(dtype=float)
     highs = window["high"].to_numpy(dtype=float)
     lows = window["low"].to_numpy(dtype=float)
@@ -114,17 +151,27 @@ def detect_order_blocks(
         if prev_body < min_ob_body_ratio * atr_arr[i - 1]:
             continue  # candle too small relative to recent volatility to count as an OB
 
-        if prev_close < prev_open and curr_close > curr_open:
-            if curr_close > prev_high:
+        engulf_type = _body_engulf_type(prev_open, prev_close, curr_open, curr_close)
+        if engulf_type is None:
+            continue
+
+        ob_list.append({
+            "type": engulf_type, "high": float(prev_high), "low": float(prev_low),
+            "index": i, "time": ts, "pattern": "single",
+        })
+
+        if i >= 2:
+            prior_engulf_type = _body_engulf_type(
+                opens[i - 2], closes[i - 2], prev_open, prev_close,
+            )
+            # The middle candle (prev, i-1) itself engulfed the opposite-direction
+            # candle before it (i-2) - upgrade: flag the middle candle as a double
+            # order block, same zone convention (its own high/low), same type as
+            # the base result just appended above.
+            if prior_engulf_type is not None and prior_engulf_type != engulf_type:
                 ob_list.append({
-                    "type": "bullish", "high": float(prev_high), "low": float(prev_low),
-                    "index": i, "time": ts,
-                })
-        elif prev_close > prev_open and curr_close < curr_open:
-            if curr_close < prev_low:
-                ob_list.append({
-                    "type": "bearish", "high": float(prev_high), "low": float(prev_low),
-                    "index": i, "time": ts,
+                    "type": engulf_type, "high": float(prev_high), "low": float(prev_low),
+                    "index": i, "time": ts, "pattern": "double",
                 })
 
     return ob_list

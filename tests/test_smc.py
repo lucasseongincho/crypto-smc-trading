@@ -113,6 +113,90 @@ class TestBosChochNoSpuriousEventOnTightening(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+class TestOrderBlockBodyEngulfRedefinition(unittest.TestCase):
+    """Phase 1 of the 2026-09 detector rebuild (see
+    ../crypto-smc-bot-notes/decisions/2026-09-03-detector-rebuild-decision.md):
+    order blocks are now a plain body-engulf pattern, not close-break-high. These
+    tests are deliberately NOT bit-identical-compatible with the old behavior -
+    that's the point of the redefinition, not a regression."""
+
+    def test_body_engulf_without_close_break_now_qualifies(self):
+        # curr's body fully wraps prev's body, but curr's close (100.4) never
+        # breaks prev's high (100) - the old close-break-high test would have
+        # rejected this outright. The new body-engulf test accepts it.
+        df = _df_from_ohlc([
+            (99.8, 100, 99.5, 99.6),   # red, body [99.6, 99.8]
+            (99.5, 100.5, 99.4, 100.4),  # green, body [99.5, 100.4] wraps [99.6, 99.8]
+        ])
+        obs = detect_order_blocks(df)
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]["type"], "bullish")
+        self.assertEqual(obs[0]["pattern"], "single")
+
+    def test_partial_body_overlap_without_full_wrap_is_rejected(self):
+        # curr's body only partially overlaps prev's body - not a full engulf.
+        df = _df_from_ohlc([
+            (100, 101, 99, 99.5),   # red, body [99.5, 100]
+            (99.7, 102, 99, 101.5),  # green, body [99.7, 101.5] - low 99.7 > prev low 99.5
+        ])
+        self.assertEqual(detect_order_blocks(df), [])
+
+    def test_same_color_candles_never_qualify_as_engulf(self):
+        df = _df_from_ohlc([
+            (99, 100, 98.5, 99.8),   # green
+            (99.5, 101, 99.4, 100.9),  # also green, body wraps prev's body
+        ])
+        self.assertEqual(detect_order_blocks(df), [])
+
+    def test_double_order_block_upgrades_the_middle_candle(self):
+        # A(bearish) -> B(bullish, engulfs A's body) -> C(bearish, engulfs B's
+        # body). The base pair-engulf test (B, C) already flags B as a resistance
+        # order block; because B *also* engulfed A (the opposite-direction
+        # candle before it), B additionally gets a "double" pattern flag.
+        df = _df_from_ohlc([
+            (100, 100.2, 98.5, 99),      # A: red, body [99, 100]
+            (98.8, 101, 98.7, 100.9),    # B: green, body [98.8, 100.9] wraps A's [99,100]
+            (101.2, 101.3, 98, 98.5),    # C: red, body [98.5, 101.2] wraps B's [98.8,100.9]
+        ])
+        obs = detect_order_blocks(df)
+        # A is engulfed by B -> single bullish OB at A (index 1).
+        # B is engulfed by C -> single bearish OB at B (index 2), PLUS the double
+        # upgrade (also index 2, since it's found while examining the (B, C) pair).
+        single_obs = [o for o in obs if o["pattern"] == "single"]
+        double_obs = [o for o in obs if o["pattern"] == "double"]
+        self.assertEqual(len(single_obs), 2)
+        self.assertEqual(len(double_obs), 1)
+
+        bullish_single = [o for o in single_obs if o["type"] == "bullish"][0]
+        self.assertEqual(bullish_single["high"], 100.2)  # A's wick high, not body top
+        self.assertEqual(bullish_single["low"], 98.5)    # A's wick low, not body bottom
+
+        bearish_single = [o for o in single_obs if o["type"] == "bearish"][0]
+        double = double_obs[0]
+        # Same zone (the middle candle B's own high/low) for both the base
+        # single-pair result and its double-pattern upgrade - it's the same
+        # candle, just carrying an extra flag, not a separate zone.
+        self.assertEqual(double["type"], "bearish")
+        self.assertEqual(double["high"], bearish_single["high"])
+        self.assertEqual(double["low"], bearish_single["low"])
+        self.assertEqual(double["high"], 101)    # B's wick high, not body top
+        self.assertEqual(double["low"], 98.7)    # B's wick low, not body bottom
+
+    def test_no_double_upgrade_when_look_back_pair_is_same_direction(self):
+        # A(bearish) -> B(bearish, same direction - no engulf relationship
+        # matters here since same-color pairs never register at all) -> C(bearish,
+        # engulfs B). No opposite-direction engulf immediately before B, so no
+        # double-OB upgrade - just the ordinary single OB from (B, C) if B is
+        # itself green, which it isn't here, so nothing at all fires from this
+        # pair; kept intentionally trivial/negative.
+        df = _df_from_ohlc([
+            (100, 100.1, 99, 99.5),   # A: red
+            (99.4, 99.6, 98, 98.5),   # B: red (same direction as A)
+            (98.6, 98.7, 97, 97.5),   # C: red (same direction as B)
+        ])
+        self.assertEqual(detect_order_blocks(df), [])
+
+
 class TestNewSizeFilterParametersDefaultToOff(unittest.TestCase):
     """min_ob_body_ratio/min_fvg_gap_ratio/min_break_distance were added so these
     previously-invisible, hardcoded-off assumptions are visible and configurable
