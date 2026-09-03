@@ -1,61 +1,43 @@
 # SMC detector logic, as actually implemented
 
 This documents exactly what `data/smc.py` checks and how `signals/smc_aggregator.py`
-uses it — against the real code, not the generic textbook description of SMC. Written
-because several of these diverge from the textbook version in ways that matter for
-interpreting backtest results, and "I'll remember" isn't a substitute for a written
-record.
+uses it — against the real code, not the generic textbook description of SMC, and not
+the reference video this system was rebuilt to match on paper. Written because several
+of these diverge from both in ways that matter for interpreting backtest results, and
+"I'll remember" isn't a substitute for a written record.
 
-All line numbers below are against `data/smc.py` and `signals/smc_aggregator.py` as of
-this commit. **Update note 1:** `min_ob_body_ratio`, `min_fvg_gap_ratio`, and
-`min_break_distance` were added after the original audit below — they follow the exact
-same pattern `lookback_bars` already used (a named parameter, a sensible-but-off
-default, an explicit TODO comment), not the `min_confluence` pattern (no default,
-enforced-required). Defaulted to `0.0`, which reproduces the prior hardcoded-off
-behavior byte-for-byte — nothing about detector *output* changed, only what's now
-configurable. See the [summary table](#summary-every-parameter-in-one-table) for the
-full up-to-date parameter list.
+**What this system is today** (2026-09): six detectors over an OHLCV window — order
+block, FVG, swing (fractal pivots, feeding the two below), trendline, channel, and
+fakeout/trap — computed by `data/smc.py::compute_smc_features` into one feature dict.
+`signals/smc_aggregator.py::SMCSignalAggregator` turns that into a single directional
+call via **5 independent confluence votes** (order block, FVG, trendline, channel,
+fakeout/trap — swing itself doesn't vote, it only feeds the trendline/channel fits),
+each worth `+1`/`-1`, no veto mechanism. A seventh detector, BOS/CHoCH
+(`detect_bos_choch`), still runs on every call — its swing-confirmation machinery is
+shared infrastructure the trendline/channel fits also rely on — but its own output
+(`structure_events`/`structure_bias`) is not read by the aggregator or drawn on the
+dashboard; it is fully retained code with no remaining consumer. See each section below
+for the literal, current behavior; see [Design history](#design-history-why-this-looks-the-way-it-does)
+near the end for the record of *why* it evolved to this shape, kept separate from the
+"what it does now" sections above it so the two don't get tangled.
 
-**Update note 2:** `detect_order_blocks`, `detect_fvg`, `detect_swings`, and
-`detect_bos_choch` were subsequently rewritten to read from precomputed numpy arrays
-(`window["high"].to_numpy(dtype=float)`, etc.) instead of `window.iloc[i]["field"]`
-inside their loops - a performance fix (the original `.iloc`-per-element pattern made
-`backtest/tune.py`'s grid search take an estimated ~17 hours even parallelized across
-16 cores; the rewrite brought that to a practical ~1.2 hours). This changed *how* each
-value is read, not the comparisons, arithmetic, or their order - every literal
-condition described below is unchanged, just quoted against the current variable
-names (`prev_close`, `curr_close`, etc. - plain numpy scalars - rather than
-`prev["close"]`/`curr["close"]` pandas row access). Verified bit-identical (exact
-`==`, not floating-point-tolerance) two ways: a one-off run of both the old and new
-implementations against the full real 1,313,022-row merged archive at migration
-time, and a permanent regression test
-(`tests/test_smc_vectorization_equivalence.py`) that embeds a frozen copy of the
-original `.iloc`-based implementation and diffs it against the live one on a
-synthetic fixture, so future edits to this hot path can't silently drift without a
-test noticing. `_atr()` itself was left completely untouched (still
-`pandas.rolling().mean()`, not a numpy reimplementation) specifically to avoid any
-risk of a different floating-point summation order; `compute_smc_features` now
-computes it once and passes it to both `detect_order_blocks` and `detect_fvg`
-(previously computed twice, redundantly - measured as over half of the pre-shared
-runtime).
+**Two things worth knowing before reading further, because they're easy to get wrong
+from a paraphrase:**
 
-**Headline finding**: "liquidity sweep" and "fakeout" are not two detectors — there is
-one function, `detect_fakeout`, and it is not implemented as "a BOS/CHoCH that got
-invalidated." See [Liquidity sweep / fakeout](#liquidity-sweep--fakeout-one-detector-not-two)
-below.
-
-**Second headline finding**: order block validity has **no** BOS/CHoCH gating and no
-mitigation tracking anywhere in this codebase — not in the detector, not in the
-aggregator, not in the one other place `order_blocks` gets read (`backtest/runner.py`'s
-stop-loss placement). A minimum-size filter now exists (`min_ob_body_ratio`, defaulted
-off) — see [Order block](#order-block-detect_order_blocks-lines-52-92) — but BOS-gating
-and mitigation tracking are still just not built.
+1. "Liquidity sweep" and "fakeout" are not two detectors — there is one function,
+   `detect_fakeout`, generalized (2026-09) to check multiple kinds of levels and paired
+   with a new, separate trap pattern. See [Fakeout / trap](#fakeout--trap-detect_fakeout).
+2. Order block validity has **no** BOS/CHoCH gating and no mitigation tracking anywhere
+   in this codebase — not in the detector, not in the aggregator, not in the one other
+   place `order_blocks` gets read (`backtest/runner.py`'s stop-loss placement). A
+   minimum-size filter exists (`min_ob_body_ratio`); BOS-gating and mitigation tracking
+   are simply not built. See [Order block](#order-block-detect_order_blocks).
 
 ---
 
-## Swing detection (`detect_swings`, lines 192-236)
+## Swing detection (`detect_swings`)
 
-**Literal condition.** `highs`/`lows` are `window["high"]`/`window["low"]` as numpy
+`detect_swings`, lines 239-293. **Literal condition.** `highs`/`lows` are `window["high"]`/`window["low"]` as numpy
 arrays. For each candidate index `i` (only indices with at least `left_bars` candles
 before and `right_bars` candles after are even considered — the loop is `for i in
 range(left_bars, n - right_bars)`):
@@ -76,7 +58,7 @@ mirror image on `lows`/`curr_low` with `<=`.
 |---|---|---|---|
 | `left_bars` | `3` | `detect_swings()` signature | Hardcoded literal default. **Not** flagged as a TODO anywhere in the code, unlike `lookback_bars` — but just as unvalidated for 5-minute crypto bars. |
 | `right_bars` | `3` | `detect_swings()` signature | Same as above. |
-| Both, passed through as | `swing_left_bars=3`, `swing_right_bars=3` | `compute_smc_features()` signature (lines 399-400) | Hardcoded defaults, no TODO comment. |
+| Both, passed through as | `swing_left_bars=3`, `swing_right_bars=3` | `compute_smc_features()` signature (line 1035) | Hardcoded defaults, no TODO comment. |
 
 **Confirmation lag.** A swing at index `i` cannot be known until `i + right_bars`
 candles later (you need `right_bars` future candles to confirm nothing broke it) —
@@ -97,7 +79,7 @@ comparison that never actually fit a diagonal line despite its name (the exact
 logic that used to live here is preserved below, for anyone diffing against an
 older version of this doc, but the code itself is gone — `git log` has the removal
 commit). It has been **replaced, not extended**, by a real trendline detector — see
-[Trendline](#trendline-detect_trendline-new-2026-09) below — per the rebuild
+[Trendline](#trendline-detect_trendline) below — per the rebuild
 decision: keeping both under similar names would have been confusing about which
 one a reader should trust. `compute_smc_features`'s output no longer has a
 `swing_trend` key at all; `signals/smc_aggregator.py`'s vote on it was retired in
@@ -128,10 +110,11 @@ nor lower-high-lower-low" case, e.g. higher high + lower low) fell through to
 
 ---
 
-## Trendline (`detect_trendline`, new, 2026-09)
+## Trendline (`detect_trendline`)
 
-Real diagonal trendlines — Phase 2 of the detector rebuild, replacing
-`classify_swing_trend` above. Fits **two independent lines**: a **support** line
+`detect_trendline`, lines 404-503; `_fit_line`, lines 294-313; `_TrendlineTracker`,
+lines 334-403. Real diagonal trendlines, replacing `classify_swing_trend` above.
+Fits **two independent lines**: a **support** line
 through confirmed swing **lows** (the uptrend line) and a **resistance** line
 through confirmed swing **highs** (the downtrend line), via least-squares over the
 most recent `trendline_points` confirmed swings of each type.
@@ -207,10 +190,11 @@ path (the grid isn't being re-run as part of this rebuild).
 
 ---
 
-## Channel (`detect_channel`, new, 2026-09)
+## Channel (`detect_channel`)
 
-Parallel channel boundaries around the Phase 2 trendlines — Phase 3 of the
-detector rebuild. The rebuild decision's own framing: "a parallel line to the
+`detect_channel`, lines 565-697; `_fit_parallel_line`, lines 504-518;
+`_channel_bar_events`, lines 519-564. Parallel channel boundaries around the
+trendlines above. The rebuild decision's own framing: "a parallel line to the
 trendline, connecting the corresponding highs/lows, same slope." Built two ways,
 tracked simultaneously (there's no "current trend direction" concept left to pick
 just one — `classify_swing_trend` was removed, not replaced with an equivalent):
@@ -294,7 +278,17 @@ window, chronological, each `{"type", "channel": "ascending"|"descending",
 
 ---
 
-## BOS / CHoCH (`detect_bos_choch`, lines 269-360)
+## BOS / CHoCH (`detect_bos_choch`) — retained, unread
+
+`detect_bos_choch`, lines 698-803. Still runs on every `compute_smc_features` call; its swing-confirmation
+machinery is shared infrastructure `detect_trendline`/`detect_channel` also
+rely on (see the [Trendline](#trendline-detect_trendline) section's `_TrendlineTracker`). But
+**nothing reads this detector's own output anymore** — not the aggregator
+(retired in the 5-vote rewire; see [Aggregator](#aggregator-signalssmc_aggregatorpy)),
+not the dashboard (BOS/CHoCH's chip, overlay, and palette colors were removed
+outright). `structure_events`/`structure_bias` are still computed and still sit
+in `compute_smc_features`'s return dict, fully live code with zero remaining
+consumers — described below exactly as it behaves, in case that changes again.
 
 This is the most stateful detector and the one most worth reading carefully, because
 two of its behaviors are easy to get wrong from a paraphrase.
@@ -305,7 +299,7 @@ unbroken candidate swing high/low dicts, or `None`), `bias` (`None` / `"bullish"
 
 **Per bar `i` (0..len(window)-1), two separate mechanisms, in this order:**
 
-**(a) Swing-confirmation phase** (lines 318-338) — a `while` loop that processes every
+**(a) Swing-confirmation phase** (lines 747-767) — a `while` loop that processes every
 swing whose confirmation point has arrived: `swings_sorted[swing_ptr]["index"] +
 right_bars <= i`. For each newly-confirmed swing `s`:
 
@@ -321,7 +315,7 @@ right_bars <= i`. For each newly-confirmed swing `s`:
   "bearish"`.
 - **Not gated by `min_break_distance`** — see below.
 
-**(b) Close-crossing phase** (lines 340-358) — runs every bar, independent of whether
+**(b) Close-crossing phase** (lines 769-787) — runs every bar, independent of whether
 phase (a) did anything this bar:
 
 - `close = closes[i]` (`closes` is `window["close"]` as a numpy array, precomputed
@@ -376,23 +370,14 @@ with **no** event — this is intentional, not a gap.
 | Param | Default | Status |
 |---|---|---|
 | `right_bars` | `3`, reused from `swing_right_bars` | Not independently configurable — tied 1:1 to the swing detector's `right_bars`. Hardcoded, no TODO. |
-| `min_break_distance` | `0.0` (`DEFAULT_MIN_BREAK_DISTANCE`, line 266) | **Explicit TODO.** Raw price distance (not an ATR ratio like the OB/FVG filters — that's what was asked for) the close must clear beyond the level. `0.0` reproduces the prior "any close beyond the level, however small, breaks it" behavior exactly. **Scoping choice, documented in the function's own docstring:** applies only to phase (b), the close-crossing check — phase (a)'s wick-based swing-supersession check is unaffected, so a nonzero `min_break_distance` can still be circumvented via that path. |
+| `min_break_distance` | `0.0` (`DEFAULT_MIN_BREAK_DISTANCE`, line 695) | **Explicit TODO.** Raw price distance (not an ATR ratio like the OB/FVG filters — that's what was asked for) the close must clear beyond the level. `0.0` reproduces the prior "any close beyond the level, however small, breaks it" behavior exactly. **Scoping choice, documented in the function's own docstring:** applies only to phase (b), the close-crossing check — phase (a)'s wick-based swing-supersession check is unaffected, so a nonzero `min_break_distance` can still be circumvented via that path. |
 
-**2026-09 rebuild, Phase 5: no longer read by the aggregator at all.**
-`compute_smc_features` still exposes `"structure_bias":
-structure_events[-1]["direction"] if structure_events else None`, and
-`structure_events`/`structure_bias` are both still computed on every call - but
-`signals/smc_aggregator.py` no longer reads either key. The 5-vote rewire (see
-the Aggregator section near the end of this document) replaced the old 4-vote
-model's `structure_bias` vote with the new trendline/channel votes instead of
-carrying it forward. The detector itself, and the swing-confirmation machinery
-it depends on, are unaffected — `detect_bos_choch` still runs, its output is
-just no longer consumed for confluence scoring. (Phase 6 goes further and
-removes BOS/CHoCH from the *dashboard* entirely - chip, overlay, palette color
-- while keeping the underlying swing detection `detect_trendline`/
-`detect_channel` share; see that section.)
+`compute_smc_features` exposes `"structure_bias":
+structure_events[-1]["direction"] if structure_events else None` — just the
+**direction** of the chronologically last event, whatever its `type`. As
+described at the top of this section, nothing reads it.
 
-> **Unused distinction (predates the rebuild, now doubly true).** The
+> **Unused distinction.** The
 > BOS-vs-CHoCH `type` label this detector computes was already never read by
 > the old aggregator - only `direction` was. Now neither field is read by the
 > aggregator at all. The strategy has never been able to tell (and still isn't
@@ -400,7 +385,9 @@ removes BOS/CHoCH from the *dashboard* entirely - chip, overlay, palette color
 
 ---
 
-## Order block (`detect_order_blocks`, lines 70-155ish)
+## Order block (`detect_order_blocks`)
+
+`detect_order_blocks`, lines 96-188; `_body_engulf_type`, lines 70-95.
 
 **2026-09 redefinition — body-engulf, not close-break-high.** Before this rebuild,
 qualifying as an order block additionally required curr's *close* to break past
@@ -512,7 +499,9 @@ engulfs qualify, not *how* validity is decided.
 
 ---
 
-## FVG (`detect_fvg`, lines 142-189)
+## FVG (`detect_fvg`)
+
+`detect_fvg`, lines 189-238.
 
 **Literal condition.** `highs`/`lows` are `window`'s high/low columns as numpy
 arrays. For `c1_high, c1_low = highs[i-2], lows[i-2]` and `c3_high, c3_low =
@@ -536,23 +525,24 @@ that skips candle 2's range entirely) — no divergence in kind.
 
 | Param | Default | Status |
 |---|---|---|
-| `min_fvg_gap_ratio` | `0.0` (`DEFAULT_MIN_FVG_GAP_RATIO`, line 139) | **Explicit TODO.** Same ATR-ratio unit as `min_ob_body_ratio`, for consistency. `0.0` reproduces the prior "any nonzero gap qualifies" behavior exactly. |
+| `min_fvg_gap_ratio` | `0.0` (`DEFAULT_MIN_FVG_GAP_RATIO`, line 186) | **Explicit TODO.** Same ATR-ratio unit as `min_ob_body_ratio`, for consistency. `0.0` reproduces the prior "any nonzero gap qualifies" behavior exactly. |
 
 Still no filter on candle 2's range/momentum (some FVG variants require candle 2 to
 be a large/impulsive candle; this implementation doesn't look at candle 2 at all, for
 any purpose). No mitigation check — same as order blocks, only `fvgs[-1]` (the most
-recent) is read by the aggregator (lines 105-111), with no check for whether price
-has since traded back through the gap.
+recent) is read by the aggregator (`signals/smc_aggregator.py` line 126), with no
+check for whether price has since traded back through the gap.
 
 ---
 
-## Liquidity sweep / fakeout / trap: generalized levels, plus a new pattern (`detect_fakeout`, 2026-09 rebuild Phase 4)
+## Fakeout / trap (`detect_fakeout`)
 
-The original audit's question list treated "liquidity sweep" and "fakeout" as
-separate detectors. **They still are not** — there is exactly one function,
-`detect_fakeout`, and its classic sweep-and-reclaim output types are still
-literally named `"BULL_FAKEOUT"` / `"BEAR_FAKEOUT"`. What changed in the 2026-09
-rebuild is everything else about this function's role and reach.
+`detect_fakeout`, lines 921-1034; `_detect_trap`, lines 804-920. "Liquidity
+sweep" and "fakeout" are not two detectors — there is exactly one
+function, `detect_fakeout`, and its classic sweep-and-reclaim output types are
+literally named `"BULL_FAKEOUT"` / `"BEAR_FAKEOUT"`. It now does two things: the
+classic sweep-and-reclaim check (generalized across three kinds of levels) and,
+separately, trap detection (a new multi-bar pattern).
 
 > ### ⚠️ Role change: veto → vote — the single biggest behavioral change in this rebuild
 >
@@ -659,7 +649,7 @@ removal got in Phase 2).
 
 ---
 
-## Aggregator (`signals/smc_aggregator.py`, 2026-09 rebuild Phase 5)
+## Aggregator (`signals/smc_aggregator.py`)
 
 **Old model: 4 votes + 1 veto.** Order block, FVG, `swing_trend`, and
 `structure_bias` (BOS/CHoCH) each independently added `+1`/`-1` to a confluence
@@ -725,25 +715,116 @@ before — see `docs/tuning-log.md`.
 |---|---|---|---|
 | Swing (`detect_swings`) | `left_bars` | `3` | Hardcoded default. **Not** TODO-flagged anywhere. |
 | Swing | `right_bars` | `3` | Hardcoded default. **Not** TODO-flagged anywhere. |
-| BOS/CHoCH (`detect_bos_choch`) | `right_bars` | `3` (= swing's `right_bars`) | Hardcoded, reused, not independent. |
+| BOS/CHoCH (`detect_bos_choch`) | `right_bars` | `3` (= swing's `right_bars`) | Hardcoded, reused, not independent. Unread by anything (see the BOS/CHoCH section). |
 | BOS/CHoCH | `min_break_distance` | `0.0` (`DEFAULT_MIN_BREAK_DISTANCE`) | **Explicit TODO.** Raw price distance; applies only to the close-crossing check, not the wick-based swing-supersession check (documented scoping choice). |
-| Order block (`detect_order_blocks`) | `min_ob_body_ratio` | `0.0` (`DEFAULT_MIN_OB_BODY_RATIO`) | **Explicit TODO.** Ratio of candle body to `_atr(window)`. Still no BOS-gating or mitigation check. |
+| Order block (`detect_order_blocks`) | `min_ob_body_ratio` | `0.0` (`DEFAULT_MIN_OB_BODY_RATIO`) | **Explicit TODO.** Ratio of candle body to `_atr(window)`. Still no BOS-gating or mitigation check. Applies identically to the single and double order-block patterns. |
 | FVG (`detect_fvg`) | `min_fvg_gap_ratio` | `0.0` (`DEFAULT_MIN_FVG_GAP_RATIO`) | **Explicit TODO.** Same ATR-ratio unit as the order block filter. |
-| Fakeout/sweep (`detect_fakeout`) | candles allowed before invalidation | fixed at 2 (structural, not a parameter) | Not configurable — baked into which indices (`[-1]`, `[-2]`) are read. No new parameter added here. |
+| Trendline (`detect_trendline`) | `trendline_points` | `3` (`DEFAULT_TRENDLINE_POINTS`) | **Explicit TODO.** `2` reproduces a raw two-point line exactly; `3+` is a genuine least-squares fit. |
+| Trendline | `min_trendline_break_distance` | `0.0` (`DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE`) | **Explicit TODO.** Same pattern as BOS/CHoCH's `min_break_distance`. |
+| Trendline | `right_bars` | `3` (= swing's `right_bars`) | Reused, not independent. |
+| Channel (`detect_channel`) | `trendline_points`, `min_break_distance`, `right_bars` | Reused from `detect_trendline` | Same parameters, same values — the channel's anchor line *is* the trendline. |
+| Channel | `min_channel_break_distance` | `0.0` (`DEFAULT_MIN_CHANNEL_BREAK_DISTANCE`) | **Explicit TODO.** Deliberately separate from `min_break_distance` even though both gate "close beyond a line" — different lines, different noise characteristics. |
+| Fakeout/trap (`detect_fakeout`) | classic-fakeout candle window | fixed at 2 (structural, not a parameter) | Not configurable — baked into which indices (`[-1]`, `[-2]`) are read. |
+| Fakeout/trap | `max_trap_retest_distance` | `float("inf")` (`DEFAULT_MAX_TRAP_RETEST_DISTANCE`) | **Explicit TODO.** The one inverted default in this file — gates a *maximum* distance, so "off" is infinity, not `0.0`. |
+| Fakeout/trap | `trendline_points`, `right_bars` | Reused from `detect_trendline` | Not independent. |
 | `compute_smc_features` | `lookback_bars` | `90` (`DEFAULT_LOOKBACK_BARS`) | **Explicit TODO** — tuned for daily stock bars in tradingagents-kr, flagged in-code as needing its own validation for 5m bars. |
-| `SMCSignalAggregator` | `min_confluence` | none — constructor **raises `ValueError`** if not passed explicitly | **Explicit TODO by design** — no default exists on purpose; every caller must pass a value. |
+| `SMCSignalAggregator` | `min_confluence` | none — constructor **raises `ValueError`** if not passed explicitly | **Explicit TODO by design** — no default exists on purpose; every caller must pass a value. Range is `-5..+5` (5 votes), up from `-4..+4` before the Phase 5 rewire. |
 
-All three new detector-level filters (`min_ob_body_ratio`, `min_fvg_gap_ratio`,
-`min_break_distance`) default to `0.0`, verified to reproduce the exact prior output
-of `compute_smc_features` on real snapshot data (see `tests/test_smc.py`'s
-`TestNewSizeFilterParametersDefaultToOff`) — this pass added visibility and
-configurability, not a behavior change. The later numpy rewrite (update note 2,
-above) is a separate change again verified to be behavior-preserving - see
-`tests/test_smc_vectorization_equivalence.py`.
+Every ratio/distance filter above defaults to a value that's a true no-op (`0.0` for
+minimum-distance filters, `float("inf")` for `max_trap_retest_distance`'s maximum-
+distance filter) — nothing about detector *output* changes by adding a parameter that
+defaults off, only what's configurable. This was verified two different ways for two
+different kinds of change, and the two shouldn't be confused: (1) the original
+`min_ob_body_ratio`/`min_fvg_gap_ratio`/`min_break_distance` additions, and the later
+numpy-array rewrite of the same functions' internals, were both verified **bit-
+identical** against the prior behavior (`tests/test_smc.py`'s
+`TestNewSizeFilterParametersDefaultToOff`, `tests/test_smc_vectorization_equivalence.py`)
+— those were pure visibility/performance changes, not behavior changes. (2) The 2026-09
+detector rebuild (order block redefinition, trendline/channel/trap additions,
+aggregator rewire) is explicitly **not** bit-identical-verified against anything prior
+— it's a deliberate behavior change measured against the reference video's spec, not
+the old code's output. See [Design history](#design-history-why-this-looks-the-way-it-does)
+for which category each change falls into.
 
-Note the remaining asymmetry: `lookback_bars`, `min_confluence`, and now
-`min_ob_body_ratio`/`min_fvg_gap_ratio`/`min_break_distance` all carry explicit TODO
-comments (and for `min_confluence`, an enforced required-argument guard) flagging
-them as unvalidated for 5-minute BTC/USD bars. `swing_left_bars`/`swing_right_bars`/
-the BOS `right_bars` are exactly as unvalidated, but nothing in the code flags them
+Note the remaining asymmetry: `lookback_bars`, `min_confluence`, and every `min_*`/`max_*`
+filter above carry explicit TODO comments (and for `min_confluence`, an enforced
+required-argument guard) flagging them as unvalidated for 5-minute BTC/USD bars.
+`swing_left_bars`/`swing_right_bars`/the BOS `right_bars` (reused by every detector
+built on top of swings) are exactly as unvalidated, but nothing in the code flags them
 the same way yet — they're still silently trusted at their literal default of `3`.
+
+---
+
+## Design history: why this looks the way it does
+
+This section is the *why*, kept separate from the *what* above so the two don't get
+tangled. Roughly chronological.
+
+**Detector-level size/distance filters** (`min_ob_body_ratio`, `min_fvg_gap_ratio`,
+`min_break_distance`) were added to make previously-invisible, hardcoded-off
+assumptions visible and configurable — before these existed, *any* engulf/gap/break
+qualified regardless of size, with no way to even ask "what if small ones didn't
+count." They follow `lookback_bars`' pattern (a named parameter, a no-op default, an
+explicit TODO), not `min_confluence`'s (no default, enforced-required) — a deliberate
+choice: these were retrofitted onto existing detectors, not built into a from-scratch
+constructor whose caller was always going to have to supply *something*.
+
+**The numpy-array rewrite** (`detect_order_blocks`, `detect_fvg`, `detect_swings`,
+`detect_bos_choch`) replaced `window.iloc[i]["field"]` pandas row access with
+precomputed numpy arrays inside each function's hot loop — a pure performance fix (the
+original `.iloc`-per-element pattern made `backtest/tune.py`'s grid search take an
+estimated ~17 hours even parallelized across 16 cores; the rewrite brought that to a
+practical ~1.2 hours). This changed *how* each value is read, not the comparisons,
+arithmetic, or their order. Verified bit-identical two ways: a one-off run of both the
+old and new implementations against the full real 1,313,022-row merged archive at
+migration time, and a permanent regression test
+(`tests/test_smc_vectorization_equivalence.py`) embedding a frozen copy of the original
+`.iloc`-based implementation, diffed against the live one on a synthetic fixture.
+`_atr()` itself was left completely untouched (still `pandas.rolling().mean()`)
+specifically to avoid any risk of a different floating-point summation order;
+`compute_smc_features` computes it once and shares it with both `detect_order_blocks`
+and `detect_fvg` (previously computed twice, redundantly — over half the pre-shared
+runtime).
+
+**The 2026-09 detector rebuild** — the shape described throughout this document —
+redesigned several detectors to match a reference video precisely, following a
+decision recorded outside this repository (personal reasoning, not itself a source of
+truth for the code: `../crypto-smc-bot-notes/decisions/2026-09-03-detector-rebuild-
+decision.md`). Six phases, each its own commit:
+
+1. **Order block redefinition** — body-engulf instead of close-break-high, plus the
+   double order-block pattern. See [Order block](#order-block-detect_order_blocks).
+2. **Real trendline detector** — `detect_trendline` replaces `classify_swing_trend`
+   outright (not extended — see the retired-logic note in the Swing section). See
+   [Trendline](#trendline-detect_trendline).
+3. **Channel detector** — new, built on the same `_TrendlineTracker` trendline uses.
+   See [Channel](#channel-detect_channel).
+4. **Fakeout generalized + trap added** — the classic sweep-and-reclaim check now
+   considers trendline/channel levels, not just the raw swing; trap is a genuinely new
+   multi-bar pattern. This phase also promoted fakeout/trap from a veto to a vote — the
+   single biggest behavioral change in the rebuild. See
+   [Fakeout / trap](#fakeout--trap-detect_fakeout).
+5. **Aggregator rewire** — 4 votes + 1 veto became 5 independent votes, confluence
+   range `-4..+4` became `-5..+5`. See [Aggregator](#aggregator-signalssmc_aggregatorpy).
+6. **Dashboard update** — BOS/CHoCH removed from the chart entirely; the toggle row
+   became 5 chips matching the 5 votes; new trendline/channel renderers; a detector
+   breakdown panel and a live-page risk summary panel, both ported from
+   `design-reference/`'s mockup (which had already envisioned the 5-detector shape
+   before the code caught up). See `viz/static/app.js` and `viz/control.py`.
+
+**Deliberately not bit-identical.** Unlike the numpy rewrite above, none of the six
+rebuild phases claim or verify bit-identical output against the pre-rebuild code —
+that would be the wrong bar. Correctness for this rebuild is measured against the
+reference video's spec (already reviewed against the code before the rebuild started),
+not against what the old code happened to output. Where a phase needed a design
+decision the video didn't specify exact math for (the double order-block pattern's
+precise candle sequence, the trendline's least-squares-vs-two-point-line choice, the
+channel's fixed-slope fit, direction conventions for channel touch/break events), that
+choice is documented in the relevant section above and in the code's own docstrings,
+not left implicit.
+
+**Not done as part of this rebuild, on purpose:** the 256-combination tuning grid was
+not re-run — the detector definitions changed, so the old grid's results describe a
+system that no longer exists, but re-running it is explicitly a separate, later step
+once this rebuild and the sizing/fee fix (`backtest/risk.py`'s `skip_if_capital_capped`)
+are both done. See `docs/tuning-log.md`.
