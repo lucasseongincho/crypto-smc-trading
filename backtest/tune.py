@@ -1,27 +1,40 @@
 """
 tune.py
-Coarse joint grid search over three SMC detector-level tuning parameters
-(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio) against real Kraken archive
+Coarse joint grid search over six SMC detector-level tuning parameters
+(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio, min_trendline_break_distance,
+min_channel_break_distance, max_trap_retest_distance) against real Kraken archive
 history, plus a strictly separate --evaluate-holdout path for a one-time final check
 against data the search itself never touches.
 
-min_break_distance (detect_bos_choch's close-crossing threshold) is deliberately
-NOT a grid parameter - removed outright, not deprioritized. Confirmed via a direct
-code trace: signals/smc_aggregator.py does not read structure_bias/structure_events
-(BOS/CHoCH's output) anywhere - the 2026-09 rebuild's 5-vote aggregator reads order
-block/FVG/trendline/channel/fakeout_trap only - and backtest/runner.py's
-_structural_stop_loss reads only order_blocks, never structure_bias/structure_events
-either. min_break_distance's entire causal chain terminates at detect_bos_choch's own
-output, which nothing downstream reads. Sweeping it could not have changed a single
-backtest result in this codebase - see docs/tuning-log.md for the same note kept
-alongside the actual results.
+This is the 2026-09 rebuild's grid - built on the 6-detector/5-vote system, not the
+pre-rebuild one. Two things deliberately NOT swept, both documented here rather than
+silently omitted:
+
+- min_break_distance (detect_bos_choch's close-crossing threshold) - removed
+  outright, not deprioritized. Confirmed via a direct code trace:
+  signals/smc_aggregator.py does not read structure_bias/structure_events
+  (BOS/CHoCH's output) anywhere - the 5-vote aggregator reads order block/FVG/
+  trendline/channel/fakeout_trap only - and backtest/runner.py's
+  _structural_stop_loss reads only order_blocks, never structure_bias/
+  structure_events either. Its entire causal chain terminates at detect_bos_choch's
+  own output, which nothing downstream reads. Sweeping it could not have changed a
+  single backtest result in this codebase.
+- trendline_points - fixed at its default (3), not swept. It's structural (changes
+  what points the trendline/channel fits are computed *from* - the shape of the
+  line, not a threshold that filters an already-computed value), the same category
+  as swing_left_bars/swing_right_bars, which are also fixed rather than swept.
+  Sweeping structural parameters alongside filter thresholds would conflate two
+  different kinds of question in one grid; that's a legitimate future round, not
+  this one.
 
     python -m backtest.tune
         Runs the full grid search over the tuning period and writes the complete
         result distribution to docs/tuning-log.md.
 
     python -m backtest.tune --evaluate-holdout --min-confluence 3 \
-        --min-ob-body-ratio 0.5 --min-fvg-gap-ratio 0.5
+        --min-ob-body-ratio 1.0 --min-fvg-gap-ratio 1.0 \
+        --min-trendline-break-distance 100.0 --min-channel-break-distance 100.0 \
+        --max-trap-retest-distance 100.0
         Runs exactly ONE already-chosen combination against the held-out period and
         appends the result to docs/tuning-log.md. Never invoked by the search path -
         see evaluate_holdout()'s docstring for why.
@@ -45,22 +58,30 @@ stretch, confirm on a disjoint later stretch the search never saw. Anything fanc
 is future work once this baseline separation is trusted and once more archive
 history accumulates.
 
-Why a coarse joint grid, not a fine sweep: with 3 parameters, even 4 values each is
-already 64 backtest runs (see the parallelism note below) - a fine sweep would
-multiply that combinatorially for a first pass whose only job is to find whether
-any *region* of this space looks structurally different from all-off, not to
-pinpoint an exact optimum. Fine-tuning around a promising region is legitimate
+Why a coarse joint grid, not a fine sweep: with 6 parameters, even 3-5 values each
+is already 1,215 backtest runs (see the parallelism note below) - a fine sweep
+would multiply that combinatorially for a first pass whose only job is to find
+whether any *region* of this space looks structurally different from all-off, not
+to pinpoint an exact optimum. Fine-tuning around a promising region is legitimate
 future work; doing it now, on one 9-month window, with SMC signals already known to
 be sparse on spot (see the kickoff notes' SMC-on-spot caveat), would mostly just be
-fitting this particular window's noise more precisely.
+fitting this particular window's noise more precisely. min_confluence gets its
+full 5-value range (1-5, not a further-reduced subset) since it's the aggregator's
+own discrete vote-count scale, not a continuous threshold being coarsely sampled -
+reducing it further would mean skipping over achievable, meaningfully different
+strictness levels, not just sampling a continuous range more coarsely.
 
-Parallelism: a single backtest run over the ~79,200-candle tuning window takes on
-the order of a minute. 64 runs sequentially would still take over an hour.
-run_search() uses ProcessPoolExecutor across all available CPU cores instead - each
-grid point is a fully independent backtest, so this doesn't change any result, only
-wall-clock time. Each worker process loads+slices the snapshot once (via an
-initializer) and reuses it for every point that lands on that worker, rather than
-reloading a ~100MB CSV per grid point.
+Parallelism: a single backtest run over the ~79,200-candle tuning window takes
+roughly 37s (measured directly against this snapshot with the post-rebuild
+detectors - trendline/channel each build their own state tracker per call, so this
+is slower per-run than the pre-rebuild detectors were). 1,215 runs sequentially
+would take over 12 hours. run_search() uses ProcessPoolExecutor across all
+available CPU cores instead (16 on the machine this was measured on, giving an
+estimated ~47 minutes wall-clock for the full grid) - each grid point is a fully
+independent backtest, so this doesn't change any result, only wall-clock time.
+Each worker process loads+slices the snapshot once (via an initializer) and reuses
+it for every point that lands on that worker, rather than reloading a ~100MB CSV
+per grid point.
 """
 import argparse
 import itertools
@@ -96,24 +117,77 @@ INITIAL_BALANCE = 20_000.0
 # observations, don't let a large-looking number create false confidence" habit.
 LOW_SAMPLE_TRADE_THRESHOLD = 20
 
-# ---- Coarse joint grid - 4 values per parameter, each with a stated reason -------
+# ---- Coarse joint grid - each parameter's own value count, each with a stated reason --
 
-MIN_CONFLUENCE_GRID = [1, 2, 3, 4]
-# Spans the aggregator's full valid range (4 detectors -> net confluence -4..+4,
-# and only the positive side is meaningful for a long-only, no-shorting strategy).
-# 1 = any single detector agreeing is enough (loosest, most trades). 3 is
-# tradingagents-kr's stock-tuned value - included as a reference point already
-# documented as not transferring (see signals/smc_aggregator.py), not a favored
-# guess. 4 = all 4 detectors must agree (strictest, fewest trades).
+MIN_CONFLUENCE_GRID = [1, 2, 3, 4, 5]
+# Spans the aggregator's full valid range (5 votes as of the 2026-09 rebuild's
+# aggregator rewire -> net confluence -5..+5, and only the positive side is
+# meaningful for a long-only, no-shorting strategy). All 5 achievable values are
+# included, not a coarser subset - see this module's own docstring for why
+# min_confluence is treated differently from the continuous-threshold parameters
+# below. 1 = any single detector agreeing is enough (loosest, most trades). 3 is
+# tradingagents-kr's stock-tuned value against the *old* 4-vote model - included as
+# a loose reference point already documented as not transferring even before the
+# vote count changed (see signals/smc_aggregator.py), not a favored guess. 5 = all
+# 5 detectors must agree (strictest, fewest trades) - unreachable in the pre-rebuild
+# grid, since the old aggregator only ever had 4 votes.
 
-MIN_OB_BODY_RATIO_GRID = [0.0, 0.5, 1.0, 2.0]
-MIN_FVG_GAP_RATIO_GRID = [0.0, 0.5, 1.0, 2.0]
+# Real 14-bar ATR over the tuning period (2025-04-01..2025-12-31), computed directly
+# against the snapshot this grid runs against: mean $107.42, median $84.96 (the
+# mean is pulled up by fat-tail volatility spikes - max $4047 - so median is the
+# more representative "typical bar-to-bar range" figure). Referenced below for
+# every ATR-anchored grid value, so the anchor is stated once, not re-derived per
+# parameter.
+_TUNING_PERIOD_MEDIAN_ATR = 84.96
+
+MIN_OB_BODY_RATIO_GRID = [0.0, 1.0, 2.0]
+MIN_FVG_GAP_RATIO_GRID = [0.0, 1.0, 2.0]
 # ATR-relative ratios (data/smc.py's own unit for these two filters - see
-# docs/detector-logic.md). 0.0 = off (the current default/baseline, so this grid
-# always includes "no change from today"). 0.5 = body/gap at least half the recent
-# average bar range (mild). 1.0 = at least a full ATR (a genuinely average-or-larger
-# move). 2.0 = double ATR (only unusually large displacement counts). Even steps
-# bracketing "no filter" through "strict".
+# docs/detector-logic.md) - unchanged unit from before, reduced from 4 to 3 values
+# (dropping the intermediate 0.5 "mild" step) to keep the 6-parameter grid's total
+# size tractable. 0.0 = off (the current default/baseline, so this grid always
+# includes "no change from today"). 1.0 = at least a full ATR (a genuinely
+# average-or-larger move). 2.0 = double ATR (only unusually large displacement
+# counts).
+
+MIN_TRENDLINE_BREAK_DISTANCE_GRID = [0.0, 100.0, 200.0]
+MIN_CHANNEL_BREAK_DISTANCE_GRID = [0.0, 100.0, 200.0]
+# Raw price distance in dollars at the code level (detect_trendline/detect_channel
+# take a dollar threshold, not an internally-ATR-scaled ratio like min_ob_body_ratio/
+# min_fvg_gap_ratio - see data/smc.py), but the *values* are chosen using the same
+# ATR-ratio reasoning as those two filters, anchored on _TUNING_PERIOD_MEDIAN_ATR
+# ($84.96): 0.0 = off (unchanged baseline). 100.0 is approximately 1x the tuning
+# period's median ATR - a break has to clear roughly a "typical bar's worth" of
+# price movement past the line to count. 200.0 is approximately 2x median ATR -
+# only unusually large displacement counts, same bracketing logic as the OB/FVG
+# ratio filters, just expressed in dollars because the underlying parameter is a
+# dollar threshold rather than an internally-scaled ratio. Swept independently (not
+# tied together) even though the reasoning and candidate values are shared - the
+# trendline's projected line and the channel's constructed boundary are different
+# lines with potentially different noise characteristics (see detect_channel's own
+# docstring), so a tight trendline threshold paired with a loose channel one (or
+# vice versa) is a real, distinct grid point worth covering.
+
+MAX_TRAP_RETEST_DISTANCE_GRID = [100.0, 200.0, float("inf")]
+# Unit/rationale proposed here since the video doesn't specify one (same TODO
+# treatment as every other unvalidated default in this codebase - see
+# DEFAULT_MAX_TRAP_RETEST_DISTANCE's own comment in data/smc.py). max_trap_retest_
+# distance answers "how far can the second extreme differ from the first and still
+# count as a shallow retest, not a fresh continuation" - structurally, that is the
+# same *kind* of question the OB/FVG ATR-ratio filters already answer ("is this
+# price movement significant relative to prevailing volatility, or is it noise"),
+# just applied to the gap between two swing extremes instead of a candle body or a
+# gap size. The same justification used to pick an ATR-ratio unit for those filters
+# in the first place - "BTC's price scale drifts too much for a fixed dollar
+# minimum to stay meaningful" - applies identically here, so ATR-ratio (expressed
+# in dollars, same as the two break-distance filters above, since the code
+# parameter is a raw dollar threshold) is the natural choice, not an arbitrary
+# match to the others. Values, anchored on the same _TUNING_PERIOD_MEDIAN_ATR
+# ($84.96): 100.0 (~1x median ATR) - a tight tolerance, the second extreme must
+# stay close to the first. 200.0 (~2x median ATR) - a looser tolerance. inf - the
+# code default (DEFAULT_MAX_TRAP_RETEST_DISTANCE), reproducing "off" (any second
+# extreme counts as a valid retest, however far) as the baseline reference point,
+# same role 0.0 plays for every minimum-distance filter above.
 
 # min_break_distance (detect_bos_choch's close-crossing threshold) is deliberately
 # NOT swept here - removed outright, not deprioritized. See this module's own
@@ -123,12 +197,19 @@ MIN_FVG_GAP_RATIO_GRID = [0.0, 0.5, 1.0, 2.0]
 # order_blocks. Every backtest run below uses run_backtest()'s own default
 # (DEFAULT_MIN_BREAK_DISTANCE = 0.0) implicitly, since it's never passed through.
 
+# trendline_points is deliberately NOT swept here either - fixed at its default (3)
+# for every grid point. See this module's own docstring for why (structural, same
+# category as swing_left_bars/swing_right_bars, not a filter threshold).
+
 
 @dataclass(frozen=True)
 class GridPoint:
     min_confluence: int
     min_ob_body_ratio: float
     min_fvg_gap_ratio: float
+    min_trendline_break_distance: float
+    min_channel_break_distance: float
+    max_trap_retest_distance: float
 
 
 def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) -> dict[str, Any]:
@@ -152,12 +233,18 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
         df, aggregator, risk, FillConfig(),
         min_ob_body_ratio=point.min_ob_body_ratio,
         min_fvg_gap_ratio=point.min_fvg_gap_ratio,
+        min_trendline_break_distance=point.min_trendline_break_distance,
+        min_channel_break_distance=point.min_channel_break_distance,
+        max_trap_retest_distance=point.max_trap_retest_distance,
         allow_short=allow_short,
     )
     return {
         "min_confluence": point.min_confluence,
         "min_ob_body_ratio": point.min_ob_body_ratio,
         "min_fvg_gap_ratio": point.min_fvg_gap_ratio,
+        "min_trendline_break_distance": point.min_trendline_break_distance,
+        "min_channel_break_distance": point.min_channel_break_distance,
+        "max_trap_retest_distance": point.max_trap_retest_distance,
         # Always computed (cheap, harmless when allow_short=False - short_trades
         # is just always 0 then) so the long+short diagnostic can report the split
         # without a separate code path.
@@ -167,7 +254,7 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
     }
 
 
-# Populated once per worker process by _init_worker() - avoids each of the 256
+# Populated once per worker process by _init_worker() - avoids each of the 1,215
 # grid-point tasks reloading/re-slicing the ~100MB snapshot CSV independently.
 _worker_df: pd.DataFrame | None = None
 _worker_allow_short: bool = False
@@ -186,9 +273,11 @@ def _run_point_in_worker(point: GridPoint) -> dict[str, Any]:
 
 def build_grid() -> list[GridPoint]:
     return [
-        GridPoint(c, ob, fvg)
-        for c, ob, fvg in itertools.product(
+        GridPoint(c, ob, fvg, tl_brk, ch_brk, trap)
+        for c, ob, fvg, tl_brk, ch_brk, trap in itertools.product(
             MIN_CONFLUENCE_GRID, MIN_OB_BODY_RATIO_GRID, MIN_FVG_GAP_RATIO_GRID,
+            MIN_TRENDLINE_BREAK_DISTANCE_GRID, MIN_CHANNEL_BREAK_DISTANCE_GRID,
+            MAX_TRAP_RETEST_DISTANCE_GRID,
         )
     ]
 
@@ -224,9 +313,10 @@ def run_search(
             results.append(row)
             elapsed = time.time() - t0
             print(
-                f"[{i:>3}/{len(grid)}] {elapsed:6.1f}s  "
+                f"[{i:>4}/{len(grid)}] {elapsed:6.1f}s  "
                 f"conf={row['min_confluence']} ob={row['min_ob_body_ratio']} "
-                f"fvg={row['min_fvg_gap_ratio']} "
+                f"fvg={row['min_fvg_gap_ratio']} tl_brk={row['min_trendline_break_distance']:<5} "
+                f"ch_brk={row['min_channel_break_distance']:<5} trap={row['max_trap_retest_distance']:<5} "
                 f"-> trades={row['total_trades']:>4} roi={row['roi_pct']:>7.2f}% "
                 f"pf={row['profit_factor']:.2f}"
             )
@@ -271,6 +361,9 @@ def evaluate_holdout(
     min_confluence: int,
     min_ob_body_ratio: float,
     min_fvg_gap_ratio: float,
+    min_trendline_break_distance: float,
+    min_channel_break_distance: float,
+    max_trap_retest_distance: float,
     snapshot_path: Path = DEFAULT_SNAPSHOT,
     start: str = HOLDOUT_START,
     end: str = HOLDOUT_END,
@@ -284,7 +377,10 @@ def evaluate_holdout(
     of keeping it separate.
     """
     df = load_snapshot(snapshot_path).loc[start:end]
-    point = GridPoint(min_confluence, min_ob_body_ratio, min_fvg_gap_ratio)
+    point = GridPoint(
+        min_confluence, min_ob_body_ratio, min_fvg_gap_ratio,
+        min_trendline_break_distance, min_channel_break_distance, max_trap_retest_distance,
+    )
     return _run_point(point, df)
 
 
@@ -309,8 +405,11 @@ def _metric_cells(row: dict[str, Any]) -> str:
 
 def _format_row(row: dict[str, Any]) -> str:
     flag = "†" if row["total_trades"] < LOW_SAMPLE_TRADE_THRESHOLD else " "
+    trap = row["max_trap_retest_distance"]
+    trap_cell = "inf" if trap == float("inf") else f"{trap:.1f}"
     return (
         f"| {row['min_confluence']} | {row['min_ob_body_ratio']:.2f} | {row['min_fvg_gap_ratio']:.2f} | "
+        f"{row['min_trendline_break_distance']:.1f} | {row['min_channel_break_distance']:.1f} | {trap_cell} | "
         f"{_metric_cells(row)} | {flag} |"
     )
 
@@ -329,7 +428,10 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
         "",
         f"Tuning period: **{start} -> {end}** ({TUNING_START} - {TUNING_END} by default). "
         f"{len(results)} combinations, sorted by ROI (highest first) - full distribution, not a top-N cut. "
-        "Swept: `min_confluence`, `min_ob_body_ratio`, `min_fvg_gap_ratio`.",
+        "Swept: `min_confluence` (1-5, the aggregator's full 5-vote range), `min_ob_body_ratio`, "
+        "`min_fvg_gap_ratio`, `min_trendline_break_distance`, `min_channel_break_distance`, "
+        "`max_trap_retest_distance` - 6 parameters, this is the 2026-09 rebuild's grid (order block/FVG/"
+        "trendline/channel/fakeout-trap detectors, 5-vote aggregator), not the pre-rebuild one.",
         "",
         "- **`min_break_distance` is deliberately excluded from this grid - not deprioritized, removed.** "
         "It gates `detect_bos_choch`'s close-crossing threshold, and a direct code trace confirms that "
@@ -338,6 +440,10 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
         "fakeout_trap) never reads it, and `backtest/runner.py`'s stop-loss placement reads only "
         "`order_blocks`. Sweeping it could not have changed a single result in this table - every "
         "combination below implicitly ran with `min_break_distance` at its unswept default (`0.0`).",
+        "- **`trendline_points` is fixed at its default (`3`), not swept.** It's structural (changes what "
+        "points the trendline/channel fits are computed from) rather than a filter threshold - same "
+        "category as `swing_left_bars`/`swing_right_bars`, also fixed. See `backtest/tune.py`'s module "
+        "docstring.",
         f"- Combinations with fewer than {LOW_SAMPLE_TRADE_THRESHOLD} trades are flagged `†` and should be read "
         "as low-sample, not as a genuine result - a handful of trades over 9 months of a sparse-signal "
         "strategy is not enough to distinguish structure from chance.",
@@ -345,8 +451,8 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
         f"- Trade count across the grid: min {min(trade_counts)}, median {statistics.median(trade_counts):.0f}, "
         f"max {max(trade_counts)}.",
         "",
-        f"| Conf | OB ratio | FVG ratio | {header_cells} | † |",
-        f"|---|---|---|{sep_cells}|---|",
+        f"| Conf | OB ratio | FVG ratio | TL brk$ | Ch brk$ | Trap$ | {header_cells} | † |",
+        f"|---|---|---|---|---|---|{sep_cells}|---|",
     ]
     lines.extend(_format_row(row) for row in ranked)
     lines.append("")
@@ -403,7 +509,10 @@ def write_tuning_log(results: list[dict[str, Any]], start: str, end: str, path: 
 def _diagnostic_short_section_text(
     long_only: list[dict[str, Any]], long_short: list[dict[str, Any]], start: str, end: str,
 ) -> str:
-    key = lambda r: (r["min_confluence"], r["min_ob_body_ratio"], r["min_fvg_gap_ratio"])
+    key = lambda r: (
+        r["min_confluence"], r["min_ob_body_ratio"], r["min_fvg_gap_ratio"],
+        r["min_trendline_break_distance"], r["min_channel_break_distance"], r["max_trap_retest_distance"],
+    )
     by_long_only = {key(r): r for r in long_only}
     by_long_short = {key(r): r for r in long_short}
     paired_keys = sorted(by_long_only.keys() & by_long_short.keys())
@@ -495,7 +604,10 @@ def append_holdout_result(row: dict[str, Any], start: str, end: str, path: Path 
     entry = (
         f"\n### {timestamp}\n\n"
         f"Params: `min_confluence={row['min_confluence']}`, `min_ob_body_ratio={row['min_ob_body_ratio']}`, "
-        f"`min_fvg_gap_ratio={row['min_fvg_gap_ratio']}`. "
+        f"`min_fvg_gap_ratio={row['min_fvg_gap_ratio']}`, "
+        f"`min_trendline_break_distance={row['min_trendline_break_distance']}`, "
+        f"`min_channel_break_distance={row['min_channel_break_distance']}`, "
+        f"`max_trap_retest_distance={row['max_trap_retest_distance']}`. "
         f"Evaluated on {start} -> {end}.\n\n"
         f"| {header_cells} |\n|{sep_cells}|\n"
         f"| {_metric_cells(row)} |\n"  # metric cells only - params already stated in the prose above
@@ -513,7 +625,8 @@ def main() -> None:
     parser.add_argument(
         "--evaluate-holdout", action="store_true",
         help="Run ONE combination against the held-out period instead of the grid search. "
-             "Requires --min-confluence/--min-ob-body-ratio/--min-fvg-gap-ratio.",
+             "Requires --min-confluence/--min-ob-body-ratio/--min-fvg-gap-ratio/"
+             "--min-trendline-break-distance/--min-channel-break-distance/--max-trap-retest-distance.",
     )
     parser.add_argument(
         "--diagnostic-allow-short", action="store_true",
@@ -525,6 +638,9 @@ def main() -> None:
     parser.add_argument("--min-confluence", type=int)
     parser.add_argument("--min-ob-body-ratio", type=float)
     parser.add_argument("--min-fvg-gap-ratio", type=float)
+    parser.add_argument("--min-trendline-break-distance", type=float)
+    parser.add_argument("--min-channel-break-distance", type=float)
+    parser.add_argument("--max-trap-retest-distance", type=float, help="Accepts 'inf' for no filter.")
     args = parser.parse_args()
 
     if args.evaluate_holdout:
@@ -532,6 +648,9 @@ def main() -> None:
             name for name, val in [
                 ("--min-confluence", args.min_confluence), ("--min-ob-body-ratio", args.min_ob_body_ratio),
                 ("--min-fvg-gap-ratio", args.min_fvg_gap_ratio),
+                ("--min-trendline-break-distance", args.min_trendline_break_distance),
+                ("--min-channel-break-distance", args.min_channel_break_distance),
+                ("--max-trap-retest-distance", args.max_trap_retest_distance),
             ] if val is None
         ]
         if missing:
@@ -543,6 +662,7 @@ def main() -> None:
         )
         row = evaluate_holdout(
             args.min_confluence, args.min_ob_body_ratio, args.min_fvg_gap_ratio,
+            args.min_trendline_break_distance, args.min_channel_break_distance, args.max_trap_retest_distance,
             snapshot_path=args.snapshot,
         )
         for key, label, fmt in _METRIC_COLUMNS:

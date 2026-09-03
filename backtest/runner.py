@@ -27,9 +27,13 @@ import pandas as pd
 from backtest.risk import RiskManager
 from data.smc import (
     DEFAULT_LOOKBACK_BARS,
+    DEFAULT_MAX_TRAP_RETEST_DISTANCE,
     DEFAULT_MIN_BREAK_DISTANCE,
+    DEFAULT_MIN_CHANNEL_BREAK_DISTANCE,
     DEFAULT_MIN_FVG_GAP_RATIO,
     DEFAULT_MIN_OB_BODY_RATIO,
+    DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
+    DEFAULT_TRENDLINE_POINTS,
     compute_smc_features,
 )
 from signals.smc_aggregator import SMCSignal, SMCSignalAggregator
@@ -186,6 +190,10 @@ class FillEngine:
         min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
         min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
         min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
+        trendline_points: int = DEFAULT_TRENDLINE_POINTS,
+        min_trendline_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
+        min_channel_break_distance: float = DEFAULT_MIN_CHANNEL_BREAK_DISTANCE,
+        max_trap_retest_distance: float = DEFAULT_MAX_TRAP_RETEST_DISTANCE,
         allow_short: bool = False,
     ):
         self.aggregator = aggregator
@@ -195,6 +203,10 @@ class FillEngine:
         self.min_ob_body_ratio = min_ob_body_ratio
         self.min_fvg_gap_ratio = min_fvg_gap_ratio
         self.min_break_distance = min_break_distance
+        self.trendline_points = trendline_points
+        self.min_trendline_break_distance = min_trendline_break_distance
+        self.min_channel_break_distance = min_channel_break_distance
+        self.max_trap_retest_distance = max_trap_retest_distance
         self.allow_short = allow_short
 
         self._window: deque[tuple[Any, float, float, float, float]] = deque(maxlen=lookback_bars)
@@ -240,6 +252,10 @@ class FillEngine:
             self._window_df(), lookback_bars=self.lookback_bars,
             min_ob_body_ratio=self.min_ob_body_ratio, min_fvg_gap_ratio=self.min_fvg_gap_ratio,
             min_break_distance=self.min_break_distance,
+            trendline_points=self.trendline_points,
+            min_trendline_break_distance=self.min_trendline_break_distance,
+            min_channel_break_distance=self.min_channel_break_distance,
+            max_trap_retest_distance=self.max_trap_retest_distance,
         )
         signal = self.aggregator.aggregate(features)
         if signal.direction == "BULLISH":
@@ -342,6 +358,10 @@ def run_backtest(
     min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
     min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
     min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
+    trendline_points: int = DEFAULT_TRENDLINE_POINTS,
+    min_trendline_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
+    min_channel_break_distance: float = DEFAULT_MIN_CHANNEL_BREAK_DISTANCE,
+    max_trap_retest_distance: float = DEFAULT_MAX_TRAP_RETEST_DISTANCE,
     allow_short: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     progress_every: int = 200,
@@ -354,7 +374,12 @@ def run_backtest(
     engine = FillEngine(
         aggregator, risk, fill_config, lookback_bars,
         min_ob_body_ratio=min_ob_body_ratio, min_fvg_gap_ratio=min_fvg_gap_ratio,
-        min_break_distance=min_break_distance, allow_short=allow_short,
+        min_break_distance=min_break_distance,
+        trendline_points=trendline_points,
+        min_trendline_break_distance=min_trendline_break_distance,
+        min_channel_break_distance=min_channel_break_distance,
+        max_trap_retest_distance=max_trap_retest_distance,
+        allow_short=allow_short,
     )
     n = len(df)
 

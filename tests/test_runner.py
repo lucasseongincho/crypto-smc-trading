@@ -38,7 +38,11 @@ class TestFillEngineThreadsDetectorParams(unittest.TestCase):
         # Sanity check: omitting the new kwargs entirely must behave identically to
         # passing the explicit data/smc.py defaults (all filters off).
         trades_omitted = self._run()
-        trades_explicit = self._run(min_ob_body_ratio=0.0, min_fvg_gap_ratio=0.0, min_break_distance=0.0)
+        trades_explicit = self._run(
+            min_ob_body_ratio=0.0, min_fvg_gap_ratio=0.0, min_break_distance=0.0,
+            trendline_points=3, min_trendline_break_distance=0.0,
+            min_channel_break_distance=0.0, max_trap_retest_distance=float("inf"),
+        )
         self.assertEqual(trades_omitted, trades_explicit)
 
     def test_an_extreme_min_ob_body_ratio_changes_the_result(self):
@@ -56,10 +60,41 @@ class TestFillEngineThreadsDetectorParams(unittest.TestCase):
         engine = FillEngine(
             aggregator, risk, FillConfig(),
             min_ob_body_ratio=0.5, min_fvg_gap_ratio=0.5, min_break_distance=50.0,
+            trendline_points=5, min_trendline_break_distance=25.0,
+            min_channel_break_distance=25.0, max_trap_retest_distance=100.0,
         )
         self.assertEqual(engine.min_ob_body_ratio, 0.5)
         self.assertEqual(engine.min_fvg_gap_ratio, 0.5)
         self.assertEqual(engine.min_break_distance, 50.0)
+        self.assertEqual(engine.trendline_points, 5)
+        self.assertEqual(engine.min_trendline_break_distance, 25.0)
+        self.assertEqual(engine.min_channel_break_distance, 25.0)
+        self.assertEqual(engine.max_trap_retest_distance, 100.0)
+
+    def test_run_backtest_threads_the_phase_2_4_params_through_to_compute_smc_features(self):
+        """Proves trendline_points/min_trendline_break_distance/
+        min_channel_break_distance/max_trap_retest_distance actually reach
+        compute_smc_features via run_backtest(), not just that FillEngine's
+        constructor stores them (the prior gap this closes: these 4 params existed
+        in data/smc.py but had no path from run_backtest()/FillEngine down to
+        compute_smc_features at all - see docs/tuning-log.md's audit)."""
+        from data.smc import compute_smc_features as real_compute_smc_features
+        with patch("backtest.runner.compute_smc_features", wraps=real_compute_smc_features) as mock_features:
+            df = _trending_ohlc()
+            aggregator = SMCSignalAggregator(min_confluence=1)
+            risk = RiskManager(initial_balance=20_000.0)
+            run_backtest(
+                df, aggregator, risk, FillConfig(),
+                trendline_points=5, min_trendline_break_distance=42.0,
+                min_channel_break_distance=43.0, max_trap_retest_distance=44.0,
+            )
+
+            self.assertTrue(mock_features.called)
+            _, kwargs = mock_features.call_args
+            self.assertEqual(kwargs["trendline_points"], 5)
+            self.assertEqual(kwargs["min_trendline_break_distance"], 42.0)
+            self.assertEqual(kwargs["min_channel_break_distance"], 43.0)
+            self.assertEqual(kwargs["max_trap_retest_distance"], 44.0)
 
 
 def _bearish_signal(confluence: int = -2) -> SMCSignal:

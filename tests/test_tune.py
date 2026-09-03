@@ -11,9 +11,12 @@ from tempfile import TemporaryDirectory
 import pandas as pd
 
 from backtest.tune import (
+    MAX_TRAP_RETEST_DISTANCE_GRID,
+    MIN_CHANNEL_BREAK_DISTANCE_GRID,
     MIN_CONFLUENCE_GRID,
     MIN_FVG_GAP_RATIO_GRID,
     MIN_OB_BODY_RATIO_GRID,
+    MIN_TRENDLINE_BREAK_DISTANCE_GRID,
     GridPoint,
     _run_point,
     append_holdout_result,
@@ -36,16 +39,37 @@ def _synthetic_ohlc(n: int = 60) -> pd.DataFrame:
     return df
 
 
+def _sample_row(**overrides) -> dict:
+    row = {
+        "min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5,
+        "min_trendline_break_distance": 50.0, "min_channel_break_distance": 50.0,
+        "max_trap_retest_distance": 100.0,
+        "total_trades": 12, "long_trades": 12, "short_trades": 0, "win_rate_pct": 50.0, "profit_factor": 1.5,
+        "total_pnl": 200.0, "roi_pct": 1.0, "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4,
+        "median_r_multiple": 0.3, "std_r_multiple": 0.2, "buy_hold_return_pct": 2.0,
+    }
+    row.update(overrides)
+    return row
+
+
 class TestBuildGrid(unittest.TestCase):
-    def test_grid_size_matches_the_product_of_all_three_parameter_lists(self):
+    def test_grid_size_matches_the_product_of_all_six_parameter_lists(self):
         grid = build_grid()
-        expected = len(MIN_CONFLUENCE_GRID) * len(MIN_OB_BODY_RATIO_GRID) * len(MIN_FVG_GAP_RATIO_GRID)
+        expected = (
+            len(MIN_CONFLUENCE_GRID) * len(MIN_OB_BODY_RATIO_GRID) * len(MIN_FVG_GAP_RATIO_GRID)
+            * len(MIN_TRENDLINE_BREAK_DISTANCE_GRID) * len(MIN_CHANNEL_BREAK_DISTANCE_GRID)
+            * len(MAX_TRAP_RETEST_DISTANCE_GRID)
+        )
         self.assertEqual(len(grid), expected)
-        self.assertEqual(len(grid), 64)  # 4 values each, as specified
+        self.assertEqual(len(grid), 1215)  # 5 confluence values x 3 values each for the other 5 params
 
     def test_grid_has_no_duplicate_points(self):
         grid = build_grid()
-        as_tuples = {(p.min_confluence, p.min_ob_body_ratio, p.min_fvg_gap_ratio) for p in grid}
+        as_tuples = {
+            (p.min_confluence, p.min_ob_body_ratio, p.min_fvg_gap_ratio, p.min_trendline_break_distance,
+             p.min_channel_break_distance, p.max_trap_retest_distance)
+            for p in grid
+        }
         self.assertEqual(len(as_tuples), len(grid))
 
     def test_every_grid_value_is_within_its_declared_list(self):
@@ -54,6 +78,14 @@ class TestBuildGrid(unittest.TestCase):
             self.assertIn(p.min_confluence, MIN_CONFLUENCE_GRID)
             self.assertIn(p.min_ob_body_ratio, MIN_OB_BODY_RATIO_GRID)
             self.assertIn(p.min_fvg_gap_ratio, MIN_FVG_GAP_RATIO_GRID)
+            self.assertIn(p.min_trendline_break_distance, MIN_TRENDLINE_BREAK_DISTANCE_GRID)
+            self.assertIn(p.min_channel_break_distance, MIN_CHANNEL_BREAK_DISTANCE_GRID)
+            self.assertIn(p.max_trap_retest_distance, MAX_TRAP_RETEST_DISTANCE_GRID)
+
+    def test_min_confluence_grid_spans_the_full_five_vote_range(self):
+        # Phase 5 rebuild: 5 votes, confluence range -5..+5 - the grid must cover
+        # all 5 achievable strictness levels, not a coarser subset.
+        self.assertEqual(MIN_CONFLUENCE_GRID, [1, 2, 3, 4, 5])
 
     def test_min_break_distance_is_not_a_grid_field(self):
         # Removed outright, not deprioritized - see backtest/tune.py's module
@@ -62,54 +94,59 @@ class TestBuildGrid(unittest.TestCase):
         # structure_events, backtest/runner.py's stop-loss reads only order_blocks).
         self.assertNotIn("min_break_distance", GridPoint.__dataclass_fields__)
 
+    def test_trendline_points_is_not_a_grid_field(self):
+        # Fixed at its default, not swept - structural (changes what the fit
+        # computes from), same category as swing_left_bars/swing_right_bars.
+        self.assertNotIn("trendline_points", GridPoint.__dataclass_fields__)
+
+    def test_max_trap_retest_distance_grid_includes_the_off_default(self):
+        # DEFAULT_MAX_TRAP_RETEST_DISTANCE is float("inf") - the grid's "off"
+        # baseline must reproduce that, same role 0.0 plays for the minimum-
+        # distance filters.
+        self.assertIn(float("inf"), MAX_TRAP_RETEST_DISTANCE_GRID)
+
 
 class TestRunPoint(unittest.TestCase):
     def test_returns_params_and_full_trade_level_metrics(self):
         df = _synthetic_ohlc()
-        point = GridPoint(min_confluence=1, min_ob_body_ratio=0.0, min_fvg_gap_ratio=0.0)
+        point = GridPoint(
+            min_confluence=1, min_ob_body_ratio=0.0, min_fvg_gap_ratio=0.0,
+            min_trendline_break_distance=0.0, min_channel_break_distance=0.0,
+            max_trap_retest_distance=float("inf"),
+        )
 
         row = _run_point(point, df)
 
         self.assertEqual(row["min_confluence"], 1)
         self.assertEqual(row["min_ob_body_ratio"], 0.0)
+        self.assertEqual(row["min_trendline_break_distance"], 0.0)
+        self.assertEqual(row["min_channel_break_distance"], 0.0)
+        self.assertEqual(row["max_trap_retest_distance"], float("inf"))
         self.assertNotIn("min_break_distance", row)
         for key in ["total_trades", "win_rate_pct", "profit_factor", "roi_pct", "avg_r_multiple", "median_r_multiple"]:
             self.assertIn(key, row)
 
     def test_stricter_confluence_never_produces_more_trades_than_looser_on_the_same_data(self):
         df = _synthetic_ohlc(n=90)
-        loose = _run_point(GridPoint(1, 0.0, 0.0), df)
-        strict = _run_point(GridPoint(4, 0.0, 0.0), df)
+        loose = _run_point(GridPoint(1, 0.0, 0.0, 0.0, 0.0, float("inf")), df)
+        strict = _run_point(GridPoint(5, 0.0, 0.0, 0.0, 0.0, float("inf")), df)
         self.assertLessEqual(strict["total_trades"], loose["total_trades"])
 
 
 class TestWriteTuningLog(unittest.TestCase):
     def test_writes_a_markdown_table_with_every_result_row(self):
-        results = [
-            {"min_confluence": c, "min_ob_body_ratio": 0.0, "min_fvg_gap_ratio": 0.0,
-             "total_trades": 5, "win_rate_pct": 40.0, "profit_factor": 1.2, "total_pnl": 100.0, "roi_pct": 0.5,
-             "max_drawdown_pct": 2.0, "avg_r_multiple": 0.3, "median_r_multiple": 0.2, "std_r_multiple": 0.1,
-             "buy_hold_return_pct": 1.0}
-            for c in [1, 2, 3, 4]
-        ]
+        results = [_sample_row(min_confluence=c) for c in [1, 2, 3, 4, 5]]
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "tuning-log.md"
             write_tuning_log(results, "2025-04-01", "2025-12-31", path=path)
             content = path.read_text(encoding="utf-8")
 
         self.assertIn("Grid search results", content)
-        self.assertEqual(content.count("| 1 | 0.00 |"), 1)  # one row per result, not just a top-N cut
-        self.assertEqual(content.count("| 2 | 0.00 |"), 1)
-        self.assertEqual(content.count("| 3 | 0.00 |"), 1)
-        self.assertEqual(content.count("| 4 | 0.00 |"), 1)
+        for c in [1, 2, 3, 4, 5]:
+            self.assertEqual(content.count(f"| {c} | 0.50 | 0.50 |"), 1)  # one row per result, not just a top-N cut
 
     def test_low_sample_rows_are_flagged(self):
-        results = [
-            {"min_confluence": 4, "min_ob_body_ratio": 2.0, "min_fvg_gap_ratio": 2.0,
-             "total_trades": 2, "win_rate_pct": 0.0, "profit_factor": 0.0, "total_pnl": 0.0, "roi_pct": 0.0,
-             "max_drawdown_pct": 0.0, "avg_r_multiple": 0.0, "median_r_multiple": 0.0, "std_r_multiple": 0.0,
-             "buy_hold_return_pct": None},
-        ]
+        results = [_sample_row(min_confluence=5, total_trades=2, buy_hold_return_pct=None)]
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "tuning-log.md"
             write_tuning_log(results, "2025-04-01", "2025-12-31", path=path)
@@ -118,10 +155,7 @@ class TestWriteTuningLog(unittest.TestCase):
         self.assertIn("†", content)
 
     def test_rerunning_the_search_preserves_an_existing_holdout_section(self):
-        row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5,
-               "total_trades": 12, "win_rate_pct": 50.0, "profit_factor": 1.5, "total_pnl": 200.0, "roi_pct": 1.0,
-               "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4, "median_r_multiple": 0.3, "std_r_multiple": 0.2,
-               "buy_hold_return_pct": 2.0}
+        row = _sample_row()
         results = [row]
 
         with TemporaryDirectory() as tmp:
@@ -136,15 +170,6 @@ class TestWriteTuningLog(unittest.TestCase):
 
         self.assertIn("Holdout evaluations", content_after)
         self.assertIn("Grid search results", content_after)
-
-
-def _sample_row(**overrides) -> dict:
-    row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5,
-           "total_trades": 12, "long_trades": 12, "short_trades": 0, "win_rate_pct": 50.0, "profit_factor": 1.5,
-           "total_pnl": 200.0, "roi_pct": 1.0, "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4,
-           "median_r_multiple": 0.3, "std_r_multiple": 0.2, "buy_hold_return_pct": 2.0}
-    row.update(overrides)
-    return row
 
 
 class TestDiagnosticShortSectionOrderingIsPreservedBothWays(unittest.TestCase):
@@ -212,10 +237,12 @@ class TestDiagnosticShortSectionOrderingIsPreservedBothWays(unittest.TestCase):
 
 class TestAppendHoldoutResult(unittest.TestCase):
     def test_creates_the_file_and_section_if_neither_exists(self):
-        row = {"min_confluence": 2, "min_ob_body_ratio": 1.0, "min_fvg_gap_ratio": 1.0,
-               "total_trades": 8, "win_rate_pct": 37.5, "profit_factor": 0.9, "total_pnl": -50.0, "roi_pct": -0.25,
-               "max_drawdown_pct": 1.5, "avg_r_multiple": -0.1, "median_r_multiple": -0.05, "std_r_multiple": 0.3,
-               "buy_hold_return_pct": 0.4}
+        row = _sample_row(
+            min_confluence=2, min_ob_body_ratio=1.0, min_fvg_gap_ratio=1.0,
+            total_trades=8, win_rate_pct=37.5, profit_factor=0.9, total_pnl=-50.0, roi_pct=-0.25,
+            max_drawdown_pct=1.5, avg_r_multiple=-0.1, median_r_multiple=-0.05, std_r_multiple=0.3,
+            buy_hold_return_pct=0.4,
+        )
 
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "tuning-log.md"
@@ -225,16 +252,16 @@ class TestAppendHoldoutResult(unittest.TestCase):
 
         self.assertIn("Holdout evaluations", content)
         self.assertIn("min_confluence=2", content)
+        self.assertIn("min_trendline_break_distance=50.0", content)
+        self.assertIn("min_channel_break_distance=50.0", content)
+        self.assertIn("max_trap_retest_distance=100.0", content)
         # The metric table itself must actually render, not just the params prose -
         # this specifically catches a prior bug where the table was built by
         # string-slicing _format_row()'s output and silently produced garbage.
         self.assertIn("| 8 | 37.5 | 0.90 | -50 | -0.25 | 1.50 | -0.10 | -0.05 | 0.30 |", content)
 
     def test_appending_twice_keeps_both_entries(self):
-        row = {"min_confluence": 2, "min_ob_body_ratio": 1.0, "min_fvg_gap_ratio": 1.0,
-               "total_trades": 8, "win_rate_pct": 37.5, "profit_factor": 0.9, "total_pnl": -50.0, "roi_pct": -0.25,
-               "max_drawdown_pct": 1.5, "avg_r_multiple": -0.1, "median_r_multiple": -0.05, "std_r_multiple": 0.3,
-               "buy_hold_return_pct": 0.4}
+        row = _sample_row(min_confluence=2)
 
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "tuning-log.md"
