@@ -80,6 +80,14 @@ direction-aware trigger/PnL logic needed to change.
 
 ### Diagnostic: does missing the short side explain the rest?
 
+> **⚠️ Confounded, not settled - see "Follow-up: does skip_if_capital_capped fix
+> it?" below.** Everything in this section was run entirely under the *unfixed*
+> (forced-sizing) baseline. The follow-up section shows that fixing sizing changes
+> which trades even execute and roughly halves the long-only loss on its own, so
+> this section's conclusion ("shorts make it worse") has not been re-validated
+> against the fixed sizing model. Treat it as provisional until the short diagnostic
+> is re-run post-fix - deliberately not done yet, see below.
+
 Long-only-by-design (finding 3) raised an obvious question: in a window that round-
 tripped **$74,473 → $126,073 → $87,500** (see the buy-and-hold note further down),
 a strategy that can only ever go long has zero chance to profit from - or even
@@ -110,6 +118,59 @@ remains available if a full-grid comparison becomes worth the time later - e.g. 
 finding 2's sizing/fee issue gets fixed first and the question of "does long-only
 still lose to a whipsaw regime even without the fee-drag confound" becomes the live
 one.
+
+### Follow-up: does `skip_if_capital_capped` fix it?
+
+Finding 2 above identified the mechanism (fee drag on capital-capped, forced-oversized
+positions) but stopped short of fixing it. `RiskManager` gained a
+`skip_if_capital_capped` constructor option (default `False`, so every result above
+this section is unaffected): when the risk-sized position would need more capital
+than the account has, **skip the trade entirely** instead of silently downsizing to
+whatever's affordable. `RiskManager.sizing_attempts` / `.capital_capped_trades` /
+`.capital_capped_skipped` counters track how often the cap binds and, when the flag
+is on, how many of those got skipped - this is a cheaper structural fix than
+revisiting the Spot-vs-Margin/Futures venue decision, and is tried first.
+
+**Single-combination re-run** (best-known combo - `min_confluence=4,
+min_ob_body_ratio=2.0, min_fvg_gap_ratio=2.0, min_break_distance=100.0` - same
+2025-04-01 -> 2025-12-31 tuning period, same $20,000 initial balance; the full
+256-combination grid was deliberately not re-run yet, see the conclusion below):
+
+| metric | baseline (`skip_if_capital_capped=False`) | fix (`skip_if_capital_capped=True`) |
+|---|---|---|
+| trades taken | 74 | 29 |
+| win rate | 17.6% | 34.5% |
+| profit factor | 0.12 | 0.28 |
+| ROI | **-48.49%** | **-20.11%** |
+| max drawdown | 48.5% | 21.7% |
+| avg R-multiple | -2.354 | -0.764 |
+| median R-multiple | -1.955 | -1.466 |
+| capital-cap trigger rate | 63.5% (47 of 74 sizing attempts) | 86.9% (192 of 221 sizing attempts, all 192 skipped) |
+| approx. total taker fees | $7,550 | $3,074 |
+
+**This substantially closes the gap, but does not reach profitability.** The fix
+roughly halves the loss (-48.49% -> -20.11%), and win rate, profit factor, and avg
+R-multiple all improve markedly - confirming finding 2's sizing/fee mechanism was a
+real, large driver of the -98%-median grid result, not a red herring. But -20.11%
+ROI is still a clear loss. Notably the capital-cap trigger *rate* goes **up** under
+the fix (86.9% vs 63.5%) - skipping capped trades leaves more capital sitting idle,
+which more of the strategy's frequent signals then also find unaffordable at these
+still-tight structural stop distances on a $20k account; sizing_attempts itself
+nearly triples (74 -> 221) because the account no longer gets rapidly drained by
+oversized forced positions early on, so it survives to generate (and reject) far
+more signals later.
+
+**Conclusion: sizing/fee mechanics were a substantial but not sole cause of the
+-98% figure - something else is still driving the remaining ~20% loss** (candidates:
+detector/parameter quality, the long-only constraint in this whipsaw-then-correction
+window, the fixed 1.5R take-profit ratio, or the interaction between stop distance
+and position sizing more generally). This is a partial confirmation, not a full one.
+**Per the plan, the next step is a proper full 256-combination grid re-run with
+`skip_if_capital_capped=True`** - the parameter optimum found under the old
+forced-sizing behavior is not guaranteed to still be the optimum once sizing no
+longer silently forces oversized, fee-heavy positions through. That full re-run has
+not been done yet; this single-combination result is a hypothesis test only, not a
+replacement for it.
 
 ## Grid search results
 

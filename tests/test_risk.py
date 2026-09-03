@@ -43,6 +43,58 @@ class TestRiskManagerSizing(unittest.TestCase):
         max_affordable = (1_000.0 * 0.98) / 50_000
         self.assertAlmostEqual(size, max_affordable)
 
+    def test_capital_capped_trades_counter_increments_on_cap(self):
+        risk = RiskManager(initial_balance=100_000.0, risk_pct=0.01, min_sl_distance=1.0)
+        risk.calculate_size(entry_price=50_000, stop_loss=49_999)  # $1 SL -> capped
+        risk.calculate_size(entry_price=50_000, stop_loss=49_000)  # $1000 SL -> not capped
+        self.assertEqual(risk.sizing_attempts, 2)
+        self.assertEqual(risk.capital_capped_trades, 1)
+        self.assertEqual(risk.capital_capped_skipped, 0)
+
+    def test_sizing_attempts_excludes_min_sl_distance_rejects(self):
+        # A reject on min_sl_distance never reaches the cap comparison at all.
+        self.risk.calculate_size(entry_price=50_000, stop_loss=49_990)  # below min_sl_distance
+        self.assertEqual(self.risk.sizing_attempts, 0)
+        self.assertEqual(self.risk.capital_capped_trades, 0)
+
+
+class TestSkipIfCapitalCapped(unittest.TestCase):
+    def setUp(self):
+        # Same setup as test_size_capped_by_spot_purchasing_power, but with the
+        # structural fix enabled.
+        self.risk = RiskManager(
+            initial_balance=1_000.0, risk_pct=0.50, min_sl_distance=1.0,
+            skip_if_capital_capped=True,
+        )
+
+    def test_capped_trade_is_rejected_instead_of_downsized(self):
+        size = self.risk.calculate_size(entry_price=50_000, stop_loss=49_999)
+        self.assertEqual(size, 0.0)
+
+    def test_capped_and_skipped_counters_both_increment(self):
+        self.risk.calculate_size(entry_price=50_000, stop_loss=49_999)
+        self.assertEqual(self.risk.sizing_attempts, 1)
+        self.assertEqual(self.risk.capital_capped_trades, 1)
+        self.assertEqual(self.risk.capital_capped_skipped, 1)
+
+    def test_uncapped_trade_still_sized_normally(self):
+        risk = RiskManager(
+            initial_balance=100_000.0, min_sl_distance=50.0, skip_if_capital_capped=True,
+        )
+        size = risk.calculate_size(entry_price=50_000, stop_loss=49_000)
+        self.assertEqual(size, 1.0)
+        self.assertEqual(risk.capital_capped_trades, 0)
+        self.assertEqual(risk.capital_capped_skipped, 0)
+
+    def test_default_behavior_unchanged_when_flag_omitted(self):
+        risk = RiskManager(initial_balance=1_000.0, risk_pct=0.50, min_sl_distance=1.0)
+        self.assertFalse(risk.skip_if_capital_capped)
+        size = risk.calculate_size(entry_price=50_000, stop_loss=49_999)
+        max_affordable = (1_000.0 * 0.98) / 50_000
+        self.assertAlmostEqual(size, max_affordable)
+        self.assertEqual(risk.capital_capped_trades, 1)
+        self.assertEqual(risk.capital_capped_skipped, 0)
+
 
 class TestTakeProfitPrice(unittest.TestCase):
     def setUp(self):
