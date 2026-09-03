@@ -65,7 +65,6 @@ class TestFillEngineThreadsDetectorParams(unittest.TestCase):
 def _bearish_signal(confluence: int = -2) -> SMCSignal:
     return SMCSignal(
         direction="BEARISH", confluence_score=confluence, bullish_count=0, bearish_count=2,
-        veto=False, veto_reason=None,
     )
 
 

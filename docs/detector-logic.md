@@ -378,17 +378,25 @@ with **no** event — this is intentional, not a gap.
 | `right_bars` | `3`, reused from `swing_right_bars` | Not independently configurable — tied 1:1 to the swing detector's `right_bars`. Hardcoded, no TODO. |
 | `min_break_distance` | `0.0` (`DEFAULT_MIN_BREAK_DISTANCE`, line 266) | **Explicit TODO.** Raw price distance (not an ATR ratio like the OB/FVG filters — that's what was asked for) the close must clear beyond the level. `0.0` reproduces the prior "any close beyond the level, however small, breaks it" behavior exactly. **Scoping choice, documented in the function's own docstring:** applies only to phase (b), the close-crossing check — phase (a)'s wick-based swing-supersession check is unaffected, so a nonzero `min_break_distance` can still be circumvented via that path. |
 
-**What the aggregator actually reads.** `compute_smc_features` exposes
-`"structure_bias": structure_events[-1]["direction"] if structure_events else None` —
-just the **direction** of the chronologically last event, whatever its `type`.
-`signals/smc_aggregator.py` (lines 120-125) reads only `structure_bias`
-(`"bullish"`/`"bearish"`) as one of its four confluence votes.
+**2026-09 rebuild, Phase 5: no longer read by the aggregator at all.**
+`compute_smc_features` still exposes `"structure_bias":
+structure_events[-1]["direction"] if structure_events else None`, and
+`structure_events`/`structure_bias` are both still computed on every call - but
+`signals/smc_aggregator.py` no longer reads either key. The 5-vote rewire (see
+the Aggregator section near the end of this document) replaced the old 4-vote
+model's `structure_bias` vote with the new trendline/channel votes instead of
+carrying it forward. The detector itself, and the swing-confirmation machinery
+it depends on, are unaffected — `detect_bos_choch` still runs, its output is
+just no longer consumed for confluence scoring. (Phase 6 goes further and
+removes BOS/CHoCH from the *dashboard* entirely - chip, overlay, palette color
+- while keeping the underlying swing detection `detect_trendline`/
+`detect_channel` share; see that section.)
 
-> **Unused distinction.** The BOS-vs-CHoCH `type` label this detector computes is
-> never read by the aggregator at all — only `direction`. The strategy currently
-> cannot tell (and does not try to tell) a trend-continuation break from a
-> trend-reversal break; both move the confluence score identically. If BOS-vs-CHoCH
-> is ever meant to matter for sizing/conviction, that's unbuilt, not just untuned.
+> **Unused distinction (predates the rebuild, now doubly true).** The
+> BOS-vs-CHoCH `type` label this detector computes was already never read by
+> the old aggregator - only `direction` was. Now neither field is read by the
+> aggregator at all. The strategy has never been able to tell (and still isn't
+> built to tell) a trend-continuation break from a trend-reversal break.
 
 ---
 
@@ -648,6 +656,66 @@ Phase 5 lands (before Phase 5 lands, in the intermediate commits, the
 aggregator's old veto code reads a key shape that no longer exists and simply
 never fires — a graceful no-op, not a crash, same treatment `swing_trend`'s
 removal got in Phase 2).
+
+---
+
+## Aggregator (`signals/smc_aggregator.py`, 2026-09 rebuild Phase 5)
+
+**Old model: 4 votes + 1 veto.** Order block, FVG, `swing_trend`, and
+`structure_bias` (BOS/CHoCH) each independently added `+1`/`-1` to a confluence
+score (`-4..+4`); a separate fakeout check ran *after* that score already
+produced a non-`NEUTRAL` direction and could only cancel it back to `NEUTRAL`
+when it disagreed — never independently move the score, and a fakeout that
+*agreed* with the tentative direction did nothing at all.
+
+**New model: 5 independent votes, no veto.** `swing_trend` was removed outright
+in Phase 2 (not carried forward — `classify_swing_trend` no longer exists) and
+`structure_bias` is no longer read at all (Phase 5, this section — the detector
+still runs, see the BOS/CHoCH section above). In their place: **order block,
+FVG, trendline, channel, fakeout/trap** — five votes, each `+1`/`-1`,
+confluence range **`-5..+5`**, no veto mechanism anywhere in this module
+anymore. `SMCSignal` dropped its `veto`/`veto_reason` fields entirely — there
+is nothing left for them to describe.
+
+**Literal condition, per vote:**
+
+| Vote | Reads | Bullish when | Bearish when |
+|---|---|---|---|
+| `order_block` | `order_blocks[-1]["type"]` | `"bullish"` | `"bearish"` |
+| `fvg` | `fvgs[-1]["type"]` | `"bullish"` | `"bearish"` |
+| `trendline` | `trendline["breaks"][-1]["direction"]` | `"bullish"` (a `RESISTANCE_BREAK`) | `"bearish"` (a `SUPPORT_BREAK`) |
+| `channel` | the most recent event in `channel["events"]` whose `"type"` is `"CHANNEL_BREAK"` (`CHANNEL_TOUCH` events are skipped — see below) | `"bullish"` | `"bearish"` |
+| `fakeout_trap` | `fakeout["trap"]` if not `None`, else `fakeout["fakeout"]` — one combined vote, not two | trap/fakeout `"direction"`/`"type"` bullish | bearish |
+
+Each vote reads the **most recent** item in its list, chronologically — same
+"last one wins" pattern the old `order_block`/`fvg`/`structure_bias` votes
+already used, now applied consistently to all 5.
+
+**Why `CHANNEL_TOUCH` doesn't vote.** A touch and a break at the *same*
+boundary carry *opposite* directional implications under `detect_channel`'s own
+convention (touching a ceiling implies a potential move down; breaking it
+implies bullish continuation) — mixing both event kinds into one vote would
+need its own weighting design this rebuild doesn't specify. Touches remain
+available in the feature dict for the dashboard (Phase 6) but don't move the
+confluence score.
+
+**Known correlation, not a bug.** The `trendline` and `channel` votes can and
+often will agree on the same bar, because an ascending channel's lower
+boundary *is* the support line and a descending channel's upper boundary *is*
+the resistance line (see the Channel section above) — a `SUPPORT_BREAK` is
+frequently also a `CHANNEL_BREAK` on the same boundary, on the same bar. This
+means a single underlying structural break can supply 2 of the 5 votes at
+once. Documented as an accepted consequence of Phase 3's shared-tracker design,
+not something this rewire attempts to de-duplicate.
+
+**`min_confluence` stays enforced-required, no default** — `SMCSignalAggregator.__init__`
+still raises `ValueError` if not passed explicitly, unchanged from before this
+rebuild. The reference video's own informal practice — "confirm with at least 2
+of the 5 concepts" — is noted in the constructor's docstring **as a loose
+reference point only**, the same treatment `lookback_bars`' TODO gets elsewhere
+in this codebase, not a validated or recommended value. The tuning grid is
+being re-run from scratch once the whole rebuild (through Phase 6) lands, not
+before — see `docs/tuning-log.md`.
 
 ---
 
