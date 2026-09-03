@@ -11,6 +11,12 @@ env/
 data_snapshots/*.csv
 !data_snapshots/.gitkeep
 
+# Raw Kraken OHLCVT archive downloads (multi-GB, user-supplied locally - see
+# data/kraken_archive.py) and anything extracted/leaked from them.
+data/*.zip
+data/__MACOSX/
+data/master_q4/
+
 runs/
 *.log
 

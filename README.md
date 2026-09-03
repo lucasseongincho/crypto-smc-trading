@@ -13,17 +13,27 @@ visual/interaction spec.
 
 ## Status (as of this session)
 
-- **Historical data**: Kraken's public `/OHLC` REST endpoint only retains a rolling
-  ~720 candles (`data/fetcher.py`) - not enough for real backtesting depth. Real
-  history comes from Kraken's official bulk OHLCVT archive
-  (`data/kraken_archive.py`) - the Drive-hosted zip hit Google's per-file download
-  quota when attempted from a cloud sandbox, so it's still pending a manual download.
-  The parser's gap-handling (Kraken omits any interval with no trades entirely) is
-  hardened and tested against a synthetic fixture ahead of the real archive landing
-  - see `_fill_gaps()` in that module and `tests/test_kraken_archive.py`.
-  `data_snapshots/` currently holds only a small live-pulled sample
-  (`BTC-USD_5m_2026-06-01_2026-08-30.csv`, ~106 candles) - a placeholder, not a
-  meaningful backtest dataset.
+- **Historical data**: real full history is loaded. Kraken's public `/OHLC` REST
+  endpoint only retains a rolling ~720 candles (`data/fetcher.py`) - not enough for
+  backtesting depth - so `data_snapshots/BTC-USD_5m_2013-10-06_2026-03-31.csv`
+  (**not committed** - large; regenerate via the command below) was built from the
+  official bulk OHLCVT archive plus all 13 quarterly updates through Q1 2026,
+  merged via `data/kraken_archive.py`. Actual coverage: **2013-10-06 21:30 UTC
+  through 2026-03-31 23:55 UTC**, 1,313,022 rows, a fully regular 5-minute grid
+  (verified - no unexpected holes at any of the 13 main/quarterly file boundaries).
+  257,154 rows (19.6%) are `is_gap_fill=True` - concentrated almost entirely in
+  2013-2016 (up to 92.7% of 2014, Kraken's thin-liquidity early years), dropping
+  below 0.3% from 2019 onward.
+
+  Importing this for real caught two bugs the synthetic-fixture tests hadn't:
+  `_find_pair_entry`'s `endswith()` match was silently matching `AIXBTUSD_5.csv`
+  (a different, unrelated pair) instead of `XBTUSD_5.csv` in one archive zip -
+  fixed to match the entry's exact basename. And `_fill_gaps()` being called twice
+  in the real pipeline (once per source file, again on the merged result) was
+  silently overwriting a real `is_gap_fill=True` from the first pass back to
+  `False` on the second, because by then the row had real values and no longer
+  looked missing - fixed to be idempotent (OR-ing in any pre-existing flag). Both
+  fixes are covered by regression tests in `tests/test_kraken_archive.py`.
 - **SMC detectors + regression test**: ported (`data/smc.py`, `tests/test_smc.py`),
   including the BOS/CHoCH wick-vs-close bug fix from tradingagents-kr.
 - **Signal aggregator**: ported (`signals/smc_aggregator.py`). `min_confluence` has
@@ -75,8 +85,15 @@ Paper trading and backtesting need no credentials (Kraken's public endpoints onl
 # Pull a snapshot (thin - see Status above for why real history needs the archive import)
 python -m data.fetcher --pair "BTC/USD" --interval 5 --start 2026-06-01 --end 2026-08-30
 
-# Or import Kraken's official bulk archive once you have it locally
-python -m data.kraken_archive --zip path/to/Kraken_OHLCVT.zip --pair "BTC/USD" --interval 5
+# Import Kraken's official bulk archive once you have it locally. --quarterly takes
+# any number of quarterly-update zips in one call, in chronological order (each one
+# extends/corrects the base data - see data/kraken_archive.py's build_snapshot()).
+# If the main archive arrives pre-extracted (a folder of PAIR_INTERVAL.csv files,
+# not a single zip - this happened once already, see Status above), wrap just the
+# one file you need into a minimal single-entry zip first:
+#   python -c "import zipfile; zipfile.ZipFile('main.zip','w').write('path/to/extracted/XBTUSD_5.csv', arcname='XBTUSD_5.csv')"
+python -m data.kraken_archive --zip path/to/Kraken_OHLCVT.zip --pair "BTC/USD" --interval 5 \
+  --quarterly path/to/Q1_2023.zip path/to/Q2_2023.zip  # ... in chronological order
 
 # Run tests
 python -m unittest discover tests
@@ -97,8 +114,8 @@ Before this runs unattended with live streaming or real money:
 - [x] Wire paper trading (`viz/control.py::start_paper`) to the live Kraken feed
 - [ ] Dashboard and trading engine split into separate processes
 - [ ] Kill switch / circuit breaker (drawdown halt, API-error halt, connectivity-loss halt)
-- [ ] Import the real Kraken OHLCVT archive (Drive quota-blocked from a cloud sandbox -
-      needs a manual download; `data/kraken_archive.py` is ready and tested to import it)
+- [x] Import the real Kraken OHLCVT archive (2013-10-06 through 2026-03-31 now in
+      `data_snapshots/` - not committed, regenerate via the command above)
 - [ ] Re-validate `min_confluence`, `min_sl_distance`, and `rr_ratio` against real
-      backtest data once real history is imported (all currently unvalidated defaults
+      backtest data now that real history is imported (all currently unvalidated defaults
       or explicit TODOs - see their respective docstrings)

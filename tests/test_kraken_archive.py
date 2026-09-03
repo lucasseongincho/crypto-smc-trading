@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from data.kraken_archive import build_snapshot, load_archive_pair
+from data.kraken_archive import _fill_gaps, _find_pair_entry, build_snapshot, load_archive_pair
 
 FIXTURE_CSV = Path(__file__).resolve().parent / "fixtures" / "kraken_xbtusd_5_with_gap.csv"
 
@@ -70,6 +70,88 @@ class TestLoadArchivePairGapHandling(unittest.TestCase):
         df = load_archive_pair(_zip_csv(gapless_csv), "BTC/USD", 5)
         self.assertEqual(len(df), 2)
         self.assertFalse(df["is_gap_fill"].any())
+
+
+class TestFindPairEntryDoesNotMatchALongerPairCode(unittest.TestCase):
+    """Regression test for a real bug: a genuine Kraken archive zip contains
+    AIXBTUSD_5.csv (a different pair - "AI" token vs BTC/USD, priced in the low
+    cents) alongside XBTUSD_5.csv. "AIXBTUSD_5.csv".endswith("XBTUSD_5.csv") is
+    True, so an endswith()-based match picked AIXBTUSD_5.csv instead of
+    XBTUSD_5.csv from one real archive zip - whichever came first in zf.namelist()
+    order - and silently merged a different pair's prices into a BTC/USD snapshot.
+    _find_pair_entry must match the entry's exact basename, not any suffix of it."""
+
+    def test_a_longer_pair_code_ending_in_the_target_is_not_matched(self):
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            # AIXBTUSD_5.csv deliberately placed first, mirroring the real zip's
+            # namelist order where the bug actually manifested.
+            zf.writestr("AIXBTUSD_5.csv", "1700000000,1,1,1,1,1,1\n")
+            zf.writestr("XBTUSD_5.csv", "1700000000,50000,50001,49999,50000.5,1,1\n")
+        buf.seek(0)
+
+        with zipfile.ZipFile(buf) as zf:
+            entry = _find_pair_entry(zf, "BTC/USD", 5)
+
+        self.assertEqual(entry, "XBTUSD_5.csv")
+
+    def test_load_archive_pair_returns_the_correct_pairs_prices_end_to_end(self):
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("AIXBTUSD_5.csv", "1700000000,1,1,1,1,1,1\n")
+            zf.writestr("XBTUSD_5.csv", "1700000000,50000,50001,49999,50000.5,1,1\n")
+        buf.seek(0)
+
+        df = load_archive_pair(buf, "BTC/USD", 5)
+        self.assertEqual(float(df.iloc[0]["close"]), 50000.5)  # not AIXBTUSD's 1.0
+
+    def test_nested_subfolder_entry_still_matches_by_basename(self):
+        buf = BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("Kraken_OHLCVT/XBTUSD_5.csv", "1700000000,50000,50001,49999,50000.5,1,1\n")
+        buf.seek(0)
+
+        with zipfile.ZipFile(buf) as zf:
+            entry = _find_pair_entry(zf, "BTC/USD", 5)
+
+        self.assertEqual(entry, "Kraken_OHLCVT/XBTUSD_5.csv")
+
+
+class TestFillGapsIsIdempotentAcrossMultiplePasses(unittest.TestCase):
+    """Regression test for a real bug, found once real archive data actually
+    exercised the per-file-then-merged path: build_snapshot() runs _fill_gaps once
+    per source file (inside load_archive_pair) and again on the merged result. A
+    row already flagged True by the first pass was silently overwritten to False
+    by the second pass, because by then it had real (forward-filled) numeric
+    values and no longer looked "missing" under a naive close.isna() check."""
+
+    def test_a_row_flagged_true_by_one_pass_stays_true_on_a_second_pass(self):
+        df = pd.DataFrame(
+            {"open": [100.0, 102.0], "high": [100.0, 102.0], "low": [100.0, 102.0],
+             "close": [100.0, 102.0], "volume": [1.0, 1.0], "trades": [1, 1]},
+            index=pd.DatetimeIndex(
+                [pd.Timestamp(1700000000, unit="s", tz="utc"), pd.Timestamp(1700000600, unit="s", tz="utc")],
+                name="time",
+            ),
+        )
+        once = _fill_gaps(df, 5)
+        gap_ts = pd.Timestamp(1700000300, unit="s", tz="utc")
+        self.assertTrue(once.loc[gap_ts, "is_gap_fill"])
+
+        twice = _fill_gaps(once, 5)  # simulates the second, merged-dataset pass
+        self.assertTrue(twice.loc[gap_ts, "is_gap_fill"])
+
+    def test_a_gap_filled_within_one_source_file_stays_flagged_after_the_merge(self):
+        # "main" has an internal gap at 1700000300 (rows at :00 and :10, :05 missing).
+        main_csv = "1700000000,100,101,99,100.5,10,5\n1700000600,101,102,100,101.5,8,4\n"
+        # A later quarterly file that never touches 1700000300 at all.
+        quarterly_csv = "1700001200,105,106,104,105.5,9,3\n"
+
+        df = build_snapshot(_zip_csv(main_csv), "BTC/USD", 5, quarterly_zip_paths=[_zip_csv(quarterly_csv)])
+
+        gap_ts = pd.Timestamp(1700000300, unit="s", tz="utc")
+        self.assertTrue(df.loc[gap_ts, "is_gap_fill"])
+        self.assertEqual(df.loc[gap_ts, "close"], 100.5)
 
 
 class TestBuildSnapshotFillsGapAtTheMergeSeam(unittest.TestCase):

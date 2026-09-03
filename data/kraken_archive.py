@@ -37,13 +37,23 @@ ZipSource = Path | str | IO[bytes]
 
 def _find_pair_entry(zf: zipfile.ZipFile, pair: str, interval: int) -> str:
     """Locate the CSV for `pair`/`interval` inside the archive, regardless of whether
-    it's zipped flat or under a subfolder."""
+    it's zipped flat or under a subfolder.
+
+    Matches on the entry's own basename being *exactly* PAIR_INTERVAL.csv, not on
+    endswith() - a real archive contains entries like AIXBTUSD_5.csv (a genuinely
+    different pair) alongside XBTUSD_5.csv, and "AIXBTUSD_5.csv".endswith("XBTUSD_5.csv")
+    is true. An endswith() match silently returned AIXBTUSD_5.csv instead of
+    XBTUSD_5.csv from one real archive zip (whichever entry happened to come first in
+    zf.namelist() order) before this was caught - see
+    tests/test_kraken_archive.py::test_a_longer_pair_code_ending_in_the_target_is_not_matched.
+    """
     target = f"{_resolve_pair(pair)}_{interval}.csv".lower()
     for name in zf.namelist():
-        if name.lower().endswith(target):
+        basename = name.lower().rsplit("/", 1)[-1]
+        if basename == target:
             return name
     raise FileNotFoundError(
-        f"No entry ending in '{target}' inside {zf.filename!r}. "
+        f"No entry named '{target}' inside {zf.filename!r}. "
         f"Available pairs/intervals are named PAIR_INTERVAL.csv (e.g. XBTUSD_5.csv)."
     )
 
@@ -96,6 +106,19 @@ def _fill_gaps(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
     trades==0 is already an implicit gap-fill marker in practice - but making it
     explicit means that invariant doesn't have to be re-derived (or silently
     assumed) by every downstream reader.
+
+    Idempotency (why this matters): build_snapshot() calls this twice - once per
+    file inside load_archive_pair(), then again on the merged result. A row a
+    per-file pass already synthesized is, by the second pass, no longer missing
+    (it has real numeric values from the first fill) - naively recomputing
+    is_gap_fill from scratch on the second pass would read that as "not a gap" and
+    silently overwrite the correct True with a fresh False, discarding the first
+    pass's finding. Real bug, caught once real archive data actually exercised the
+    per-file-then-merged path (a single quarterly file with an internal gap,
+    concatenated with a main archive that already covered - and had separately
+    gap-filled - that same slot). Fixed by OR-ing any is_gap_fill column already
+    present in df into the freshly-computed one, so a row flagged True by any
+    earlier pass stays True regardless of what a later pass sees.
     """
     if df.empty:
         return df.assign(is_gap_fill=pd.Series(dtype=bool))
@@ -104,7 +127,16 @@ def _fill_gaps(df: pd.DataFrame, interval_minutes: int) -> pd.DataFrame:
     full_index.name = "time"
     reindexed = df.reindex(full_index)
 
-    is_gap_fill = reindexed["close"].isna()
+    newly_missing = reindexed["close"].isna()
+    if "is_gap_fill" in df.columns:
+        # .eq(True), not .fillna(False).astype(bool): a newly-introduced row (not
+        # in df before this reindex) has NaN here, and NaN.eq(True) is already
+        # False - no fillna/downcast needed.
+        already_flagged = reindexed["is_gap_fill"].eq(True)
+    else:
+        already_flagged = pd.Series(False, index=reindexed.index)
+    is_gap_fill = newly_missing | already_flagged
+
     reindexed["close"] = reindexed["close"].ffill()
     for col in ["open", "high", "low"]:
         reindexed[col] = reindexed[col].fillna(reindexed["close"])
