@@ -96,12 +96,20 @@ fired (alongside 71 of the original 74 long trades - the extra long/short
 interaction shifts entry timing slightly), at a similar ~17% win rate to the long
 side, which - given finding 2 above - mostly means 86 more trades subject to the
 same fee-drag-on-capped-notional mechanism, not 86 trades that captured the
-correction. This does not yet prove shorts don't help across the *whole* grid (looser
-combinations with more signals could behave differently), but it directly
-contradicts treating "missing the short side" as the primary explanation for this
-particular result - finding 2's sizing/fee mechanism looks like the larger driver.
-See the "Diagnostic: long+short" section below for the full 256-combination
-comparison once/if it's run (`python -m backtest.tune --diagnostic-allow-short`).
+correction. This directly contradicts treating "missing the short side" as the
+primary explanation for this particular result - finding 2's sizing/fee mechanism
+is the larger driver.
+
+**Decision: the full 256-combination long+short re-run was deliberately not run.**
+The single-combination check already gave a clear enough directional signal (shorts
+hurt, not help, for the best-performing combination) relative to the ~80-90 extra
+minutes a full apples-to-apples grid comparison would cost, and finding 2 already
+has strong, separate quantitative evidence. `python -m backtest.tune
+--diagnostic-allow-short` (writes to the "Diagnostic: long+short" section below)
+remains available if a full-grid comparison becomes worth the time later - e.g. if
+finding 2's sizing/fee issue gets fixed first and the question of "does long-only
+still lose to a whipsaw regime even without the fee-drag confound" becomes the live
+one.
 
 ## Grid search results
 
