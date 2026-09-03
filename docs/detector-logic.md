@@ -538,76 +538,116 @@ has since traded back through the gap.
 
 ---
 
-## Liquidity sweep / fakeout: one detector, not two (`detect_fakeout`, lines 363-387)
+## Liquidity sweep / fakeout / trap: generalized levels, plus a new pattern (`detect_fakeout`, 2026-09 rebuild Phase 4)
 
 The original audit's question list treated "liquidity sweep" and "fakeout" as
-separate detectors. **They are not** — there is exactly one function,
-`detect_fakeout`, and its output types are literally named `"BULL_FAKEOUT"` /
-`"BEAR_FAKEOUT"`. Its docstring calls it a liquidity sweep ("a wick past the last
-swing that closes back on the other side"); the function/type names call it a
-fakeout. Same code, two names, no independent "liquidity sweep" concept exists
-anywhere else in this file. (No new parameter was added here — this detector wasn't
-part of the size/distance-filter request. It also wasn't touched by the numpy
-rewrite described in the module-level update note above - it only ever reads two
-candles (`window.iloc[-1]`/`window.iloc[-2]`), an O(1) cost regardless of window
-size, so there was nothing to optimize; changing it would have been pure risk for
-zero benefit.)
+separate detectors. **They still are not** — there is exactly one function,
+`detect_fakeout`, and its classic sweep-and-reclaim output types are still
+literally named `"BULL_FAKEOUT"` / `"BEAR_FAKEOUT"`. What changed in the 2026-09
+rebuild is everything else about this function's role and reach.
 
-**Literal condition.** Only ever looks at the **last two candles** in the window —
-`curr = window.iloc[-1]`, `prev = window.iloc[-2]` — and the **most recently
-confirmed swing** of each type (`recent_lows[-1]`, `recent_highs[-1]`, taken from
-whatever `swings` list was passed in):
+> ### ⚠️ Role change: veto → vote — the single biggest behavioral change in this rebuild
+>
+> Before this rebuild, `signals/smc_aggregator.py` used this detector's output
+> **only as a veto**: a fakeout opposing an already-tentative direction forced
+> that direction to `NEUTRAL`; a fakeout *agreeing* with the tentative direction
+> did nothing at all. Phase 5 (the aggregator rewire — see that section) makes
+> fakeout/trap a **genuine fifth confluence vote**, on equal footing with order
+> block / FVG / trendline / channel: it can now independently push the
+> confluence score toward `BULLISH` or `BEARISH` on its own, not just cancel an
+> existing call. Every backtest result from before Phase 5 used the old
+> veto-only model; every one after uses the new 5-vote model — they are not
+> comparable, and the tuning grid needs a full re-run once the whole rebuild
+> (through Phase 6) lands (deliberately not re-run yet — see the top of
+> `docs/tuning-log.md`).
 
-- `if recent_lows: last_low = recent_lows[-1]["price"]`; **if** `prev["low"] <
-  last_low and curr["close"] > last_low`: return `{"type": "BULL_FAKEOUT",
-  "swept_level": last_low, ...}`.
-- `if recent_highs: last_high = recent_highs[-1]["price"]`; **if** `prev["high"] >
-  last_high and curr["close"] < last_high`: return `{"type": "BEAR_FAKEOUT",
-  "swept_level": last_high, ...}`.
-- Otherwise `None`.
+**Return shape changed.** `detect_fakeout` now returns `{"fakeout": {...} |
+None, "trap": {...} | None}` — a breaking change from the prior single-dict-or-
+`None` return. `compute_smc_features`'s `"fakeout"` key holds this new nested
+dict (not renamed, to minimize churn elsewhere).
 
-**Directly answering: is this "BOS/CHoCH later invalidated," or something else?**
-**Something else, entirely independent of BOS/CHoCH.** `detect_fakeout`'s signature
-is `(window, swings)` — it does not receive `structure_events` and never looks at
-what `detect_bos_choch` concluded. It checks raw swing levels and two raw candles
-directly. Two concrete consequences:
+### Classic fakeout — generalized beyond the single raw swing level
 
-1. A swing level that was **only ever wick-broken** (never `close`-broken, so
-   `detect_bos_choch` never fired a BOS/CHoCH event on it at all) can still be
-   flagged as a fakeout here, because this function doesn't care whether a
-   structural event fired — only whether the wick/close pattern matches.
-2. The two detectors can and do run completely decoupled: nothing stops
-   `structure_bias` from saying `"bullish"` in the same feature dict where
-   `fakeout` says `"BEAR_FAKEOUT"` against a *different* swing level, or vice versa.
+Still only examines the **last two candles** (`curr = window.iloc[-1]`, `prev =
+window.iloc[-2]`) — that structural "2 candles, no configurable window"
+constraint from before is unchanged, and still baked into which array indices
+are read, not a parameter. What changed is *which levels count*:
 
-**"How many candles before invalidation" — the actual answer.** There is no
-configurable window and no "N candles to reclaim" parameter. The pattern is
-structurally fixed at exactly **2 candles**: the sweep must be in the single candle
-immediately preceding the current one (`prev`), and the reclaim must be the
-*current* candle's close (`curr`). A sweep that happened 2+ candles ago and only
-just reclaimed now is invisible to this function — by the time `curr` is examined,
-that sweep candle is no longer `prev` and the pattern doesn't match. This is a hard
-structural constraint, not a tunable default.
+- **Before**: only the single most recently confirmed swing low/high.
+- **Now**: swing (unchanged), **plus** the current Phase 2 trendline
+  (`detect_trendline`'s `support`/`resistance`, evaluated at the last bar via
+  `value_at_last_index`), **plus** the current Phase 3 channel's *derived*
+  boundaries specifically (the ascending channel's upper boundary, the
+  descending channel's lower boundary — the two that aren't already numerically
+  identical to the trendline values).
 
-**Parameters:** none configurable. The "2 candles" constraint above is baked into
-which array indices are read, not a named parameter.
+Checked in a fixed, documented priority order — **swing, then trendline, then
+channel** — and the first level that matches (`prev` wicks past it, `curr`
+closes back on the correct side) wins; this is a deliberate tie-break (multiple
+levels often sit close together and could all match the same 2-candle sweep),
+not an attempt to report every matching level. The output's `"source"` field
+(`"swing"` / `"trendline"` / `"channel"`, new) names which one fired.
 
-**How the aggregator uses it (`smc_aggregator.py`, lines 135-153).** Fakeout
-contributes **zero points** to the confluence score directly — it is not one of the
-four `bullish +=1` / `bearish +=1` factors. It only acts *after* the 4-factor
-confluence has already produced a non-`NEUTRAL` `direction`, and only as a veto when
-it **opposes** that direction:
+`trendline`/`channel` are accepted as optional precomputed parameters (`None` →
+computed internally) — the same shared-computation pattern `atr` uses for
+`detect_order_blocks`/`detect_fvg` — since without it, `compute_smc_features`
+would build 4 `_TrendlineTracker` instances per call (2 direct + 2 more inside
+this function) instead of 2.
 
-```
-if fakeout and direction != "NEUTRAL":
-    if fk_type == "BULL_FAKEOUT" and direction == "BEARISH": veto -> NEUTRAL
-    elif fk_type == "BEAR_FAKEOUT" and direction == "BULLISH": veto -> NEUTRAL
-```
+**Directly answering: is this "BOS/CHoCH later invalidated," or something
+else?** Still something else, independent of BOS/CHoCH — `detect_fakeout`
+never receives `structure_events` and never looks at what `detect_bos_choch`
+concluded. Both consequences from the original audit still hold: a swing level
+that was only ever wick-broken (never `close`-broken) can still be flagged here,
+and the two detectors can and do run completely decoupled.
 
-A fakeout that *agrees* with the tentative direction (e.g. `BULL_FAKEOUT` while
-`direction == "BULLISH"`) does nothing at all — not a bonus, not a confirmation,
-simply ignored. A fakeout while `direction == "NEUTRAL"` is also a no-op (the `if`
-guard skips it).
+### Trap (new) — a distinct multi-bar pattern, not a veto or a vote by itself
+
+See `_detect_trap`'s own docstring in `data/smc.py` for the full state-machine
+walkthrough (break → first extreme E1 → bounce → second nearby extreme E2 →
+reclaim). Summary:
+
+- **Scoped to Phase 2 trendline breaks specifically** — not also the raw swing
+  level or the Phase 3 channel-derived boundaries the classic fakeout check
+  above additionally considers. A documented scope-narrowing (unifying three
+  break sources into one unambiguous "which level broke, for stop-placement
+  purposes" answer needs its own design pass), not an oversight.
+- E1 (the extreme right after the break) becomes `stop_loss_reference` — not
+  currently wired into `backtest/runner.py`'s `_structural_stop_loss` (which
+  still only reads `order_blocks`); that wiring is out of this rebuild's scope
+  and wasn't requested.
+- E2 must be "nearby" E1 — within `max_trap_retest_distance` — *unless* E2 is
+  actually shallower than E1 (a higher low after a support break, a lower high
+  after a resistance break), which is always accepted regardless of distance.
+  `max_trap_retest_distance` defaults to `float("inf")`, not `0.0` — the only
+  parameter in this file where the "off"/no-op default is a maximum rather
+  than a minimum (see `DEFAULT_MAX_TRAP_RETEST_DISTANCE`'s comment for why
+  `0.0` would be backwards here).
+- Only reported when the reclaim bar is the **last** bar of the window —
+  mirroring the classic fakeout's own "only checks the most recent candle"
+  scoping, so this always answers "did something confirm right now," not "did
+  something ever confirm somewhere in this lookback window."
+- Named `"SUPPORT_TRAP"`/`"RESISTANCE_TRAP"` (after which level broke), **not**
+  the trader-jargon "bull trap"/"bear trap" (named after which side gets
+  trapped — the *opposite* of the break direction). Mixing those two naming
+  conventions invites exactly the kind of mislabeling bug this project already
+  hit once (see the BOS/CHoCH labeling divergence note above) — `"direction"`
+  (`"bullish"`/`"bearish"`) is the field to read for which way it resolves.
+
+**Parameters:**
+
+| Param | Default | Status |
+|---|---|---|
+| `max_trap_retest_distance` | `float("inf")` (`DEFAULT_MAX_TRAP_RETEST_DISTANCE`) | **Explicit TODO**, not validated against 5-minute BTC/USD bars. Inverted "off" value vs. every other filter in this file — see above. |
+| `trendline_points`, `right_bars` | Same as `detect_trendline`'s | Reused, not independently configurable here. |
+
+**How the aggregator uses this now:** see Phase 5 below — the old veto-only
+snippet that used to live in this section has been retired along with the code
+it described; nothing in this codebase still runs the old veto logic once
+Phase 5 lands (before Phase 5 lands, in the intermediate commits, the
+aggregator's old veto code reads a key shape that no longer exists and simply
+never fires — a graceful no-op, not a crash, same treatment `swing_trend`'s
+removal got in Phase 2).
 
 ---
 

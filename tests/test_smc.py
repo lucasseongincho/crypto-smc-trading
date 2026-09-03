@@ -16,6 +16,7 @@ from data.smc import (
     compute_smc_features,
     detect_bos_choch,
     detect_channel,
+    detect_fakeout,
     detect_fvg,
     detect_order_blocks,
     detect_swings,
@@ -493,6 +494,154 @@ class TestDetectChannel(unittest.TestCase):
         self.assertIn("ascending", feats["channel"])
         self.assertIn("descending", feats["channel"])
         self.assertIn("events", feats["channel"])
+
+
+class TestDetectFakeoutGeneralizedLevels(unittest.TestCase):
+    """Phase 4 of the 2026-09 detector rebuild: detect_fakeout now returns
+    {"fakeout": ...|None, "trap": ...|None} and checks swing/trendline/channel
+    levels in that priority order for the classic 2-candle sweep-and-reclaim."""
+
+    def test_swing_level_fires_when_no_trendline_exists_yet(self):
+        rows = [
+            (101, 102, 100, 101), (100, 101, 98, 99), (99, 100, 97, 98), (97, 98, 95, 96),
+            (97, 99, 97, 98), (98, 100, 98, 99), (99, 101, 99, 100),
+            (100, 101, 90, 92),  # prev: low=90 sweeps below the swing low (95)
+            (92, 97, 92, 96),    # curr: close=96 reclaims above 95
+        ]
+        df = _df_from_ohlc(rows)
+        swings = detect_swings(df, left_bars=3, right_bars=3)
+        result = detect_fakeout(df, swings, right_bars=3, trendline_points=3)
+        self.assertIsNotNone(result["fakeout"])
+        self.assertEqual(result["fakeout"]["type"], "BULL_FAKEOUT")
+        self.assertEqual(result["fakeout"]["source"], "swing")
+        self.assertEqual(result["fakeout"]["swept_level"], 95.0)
+        self.assertIsNone(result["trap"])
+
+    def test_falls_through_to_trendline_when_the_raw_swing_level_isnt_swept(self):
+        # Three collinear swing lows (support line: slope=1.0, intercept=96.5,
+        # confirmed at i=26) - the crafted prev/curr candles sweep well above the
+        # raw last swing low (119.5, far below current price by this point) but
+        # below the trendline's current projected value (124.5 at i=28), and
+        # reclaim above it.
+        extremes = [
+            (3, 100.0, "low"), (9, 250.0, "high"), (13, 110.0, "low"),
+            (19, 260.0, "high"), (23, 120.0, "low"),
+        ]
+        # _build_zigzag_ohlc always sizes its output to extremes[-1][0]+4 - slice
+        # to just past the last designed extreme (index 23) and hand-append the
+        # rest, since the helper's own trailing extrapolation continues in the
+        # incoming direction rather than reversing (fine for a fixture that ends
+        # mid-trend, not fine for confirming a swing as the actual endpoint).
+        rows = _build_zigzag_ohlc(extremes)[:24]
+        rows += [
+            (120.0, 200.0, 120.0, 195.0),  # 24
+            (195.0, 260.0, 195.0, 255.0),  # 25
+            (255.0, 280.0, 255.0, 275.0),  # 26: support active, line=122.5
+            (135.0, 136.0, 121.0, 124.0),  # 27: prev, low=121 (>119.5 swing, <123.5 line); close 124 (no break)
+            (124.0, 127.0, 122.0, 126.0),  # 28: curr, close=126 (>124.5 line -> reclaim)
+        ]
+        df = _df_from_ohlc(rows)
+        swings = detect_swings(df, left_bars=3, right_bars=3)
+        support = detect_trendline(df, swings, right_bars=3, trendline_points=3)["support"]
+        self.assertIsNotNone(support)  # sanity: the line must still be alive at the end
+
+        result = detect_fakeout(df, swings, right_bars=3, trendline_points=3)
+        self.assertIsNotNone(result["fakeout"])
+        self.assertEqual(result["fakeout"]["type"], "BULL_FAKEOUT")
+        self.assertEqual(result["fakeout"]["source"], "trendline")
+        self.assertAlmostEqual(result["fakeout"]["swept_level"], 124.5)
+
+
+class TestDetectTrap(unittest.TestCase):
+    """Phase 4: trap detection. Fixture: a support line breaks (crash to close=50,
+    broken_level=123.5), then a double-bottom-and-reclaim sequence - first
+    extreme (E1) at (index 31, price 39.5), a bounce high, a second nearby
+    extreme (E2) at (index 43, price 41.5, above E1 - a shallower retest), then a
+    reclaim candle closing (128) back above the broken level (123.5)."""
+
+    def setUp(self):
+        extremes = [
+            (3, 100.0, "low"), (9, 250.0, "high"), (13, 110.0, "low"),
+            (19, 260.0, "high"), (23, 120.0, "low"),
+        ]
+        rows = _build_zigzag_ohlc(extremes)[:24]
+        rows += [
+            (120.0, 200.0, 120.0, 195.0),
+            (195.0, 260.0, 195.0, 255.0),
+            (255.0, 280.0, 255.0, 275.0),
+            (275.0, 276.0, 45.0, 50.0),  # index 27: crash, SUPPORT_BREAK at 123.5
+        ]
+        post_extremes = [(3, 40.0, "low"), (9, 70.0, "high"), (15, 42.0, "low")]
+        rows += _build_zigzag_ohlc(post_extremes, start_price=50.0)[:16]  # local 0..15, absolute 28..43
+        rows += [
+            (42.0, 55.0, 42.0, 54.0),    # 44
+            (54.0, 66.0, 54.0, 65.0),    # 45
+            (65.0, 76.0, 65.0, 75.0),    # 46: confirms index 43's swing (43+3=46)
+            (75.0, 130.0, 75.0, 128.0),  # 47: reclaim, close 128 > broken_level 123.5
+        ]
+        self.rows = rows
+
+    def test_fixture_produces_the_designed_break_and_swings(self):
+        df = _df_from_ohlc(self.rows)
+        swings = detect_swings(df, left_bars=3, right_bars=3)
+        lows = [(s["index"], s["price"]) for s in swings if s["type"] == "low"]
+        self.assertEqual(lows, [(3, 99.5), (13, 109.5), (23, 119.5), (31, 39.5), (43, 41.5)])
+        breaks = detect_trendline(df, swings, right_bars=3, trendline_points=3)["breaks"]
+        self.assertEqual(breaks[0]["type"], "SUPPORT_BREAK")
+        self.assertAlmostEqual(breaks[0]["price"], 123.5)
+        self.assertEqual(breaks[0]["index"], 27)
+
+    def test_full_sequence_confirms_a_support_trap_on_the_reclaim_bar(self):
+        df = _df_from_ohlc(self.rows)
+        swings = detect_swings(df, left_bars=3, right_bars=3)
+        result = detect_fakeout(df, swings, right_bars=3, trendline_points=3)
+        trap = result["trap"]
+        self.assertIsNotNone(trap)
+        self.assertEqual(trap["type"], "SUPPORT_TRAP")
+        self.assertEqual(trap["direction"], "bullish")
+        self.assertAlmostEqual(trap["broken_level"], 123.5)
+        self.assertAlmostEqual(trap["stop_loss_reference"], 39.5)  # E1's price
+        self.assertEqual(trap["first_extreme_index"], 31)
+        self.assertEqual(trap["index"], 47)
+
+    def test_no_trap_reported_when_reclaim_isnt_on_the_current_last_bar(self):
+        # Drop the reclaim candle - the sequence is otherwise complete, but
+        # nothing reclaims on what is now the last bar.
+        df = _df_from_ohlc(self.rows[:-1])
+        swings = detect_swings(df, left_bars=3, right_bars=3)
+        result = detect_fakeout(df, swings, right_bars=3, trendline_points=3)
+        self.assertIsNone(result["trap"])
+
+    def test_trap_abandoned_when_second_extreme_extends_past_first_beyond_max_distance(self):
+        # Replace E2 (index 43, price 41.5) with a lower low (a real continuation,
+        # not a shallow retest) and require retests to stay within a tight distance.
+        rows = list(self.rows)
+        # local index 15 of the post-break zigzag is absolute index 43.
+        deep_low_extremes = [(3, 40.0, "low"), (9, 70.0, "high"), (15, 20.0, "low")]
+        post_rows = _build_zigzag_ohlc(deep_low_extremes, start_price=50.0)[:16]
+        rows[28:44] = post_rows
+        df = _df_from_ohlc(rows)
+        swings = detect_swings(df, left_bars=3, right_bars=3)
+
+        permissive = detect_fakeout(
+            df, swings, right_bars=3, trendline_points=3,
+            max_trap_retest_distance=float("inf"),
+        )
+        self.assertIsNotNone(permissive["trap"])  # default behavior - always accepted
+
+        strict = detect_fakeout(
+            df, swings, right_bars=3, trendline_points=3,
+            max_trap_retest_distance=5.0,
+        )
+        self.assertIsNone(strict["trap"])  # 20.0 is 19.5 away from E1 (39.5) - too far
+
+    def test_compute_smc_features_exposes_the_new_fakeout_trap_shape(self):
+        df = _df_from_ohlc(self.rows)
+        feats = compute_smc_features(df, lookback_bars=len(df))
+        self.assertIn("fakeout", feats)
+        self.assertIn("fakeout", feats["fakeout"])
+        self.assertIn("trap", feats["fakeout"])
+        self.assertEqual(feats["fakeout"]["trap"]["type"], "SUPPORT_TRAP")
 
 
 class TestNewSizeFilterParametersDefaultToOff(unittest.TestCase):

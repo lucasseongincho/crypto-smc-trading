@@ -789,31 +789,241 @@ def detect_bos_choch(
     return events
 
 
-def detect_fakeout(window: pd.DataFrame, swings: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Liquidity sweep: a wick past the last swing that closes back on the other side.
-    Only checks the most recent candle. Detection only - signals/smc_aggregator.py
-    decides whether/how to act on it (a veto, not a bonus point)."""
-    if len(window) < 3 or not swings:
+# TODO: "nearby" for a trap's second retest extreme isn't given exact math by the
+# reference video. Unlike every other break-distance parameter in this file (which
+# gate a MINIMUM distance and default to 0.0/"off"), this one gates a MAXIMUM
+# distance - "off" (no filter, accept any second extreme as a valid retest) means
+# infinity, not zero; 0.0 here would require the second extreme to land at exactly
+# the same price as the first, which would essentially never fire. Deliberately not
+# validated against 5-minute BTC/USD bars yet - same placeholder treatment as every
+# other TODO default in this file, just inverted because this default's "off" value
+# is a maximum, not a minimum.
+DEFAULT_MAX_TRAP_RETEST_DISTANCE = float("inf")
+
+
+def _detect_trap(
+    window: pd.DataFrame,
+    swings: list[dict[str, Any]],
+    trendline_breaks: list[dict[str, Any]],
+    max_trap_retest_distance: float,
+) -> dict[str, Any] | None:
+    """Trap pattern (new, 2026-09 rebuild Phase 4): a level breaks, price forms a
+    first extreme, bounces away from it, forms a second nearby extreme (a failed
+    retest), then reclaims back past the broken level - the rebuild decision's own
+    phrasing, first extreme as the stop-loss reference.
+
+    **Scoped to Phase 2 trendline breaks specifically** - not also the raw swing
+    level or the Phase 3 channel-derived boundaries the classic fakeout check in
+    detect_fakeout() below additionally considers. Unifying three different break
+    sources into one unambiguous "which level broke, for stop-placement purposes"
+    answer needs its own design pass; this is a documented scope-narrowing for the
+    trap state machine specifically, not an oversight - the classic fakeout check
+    still gets the full generalization the rebuild asked for.
+
+    State machine, run once per breaks in `trendline_breaks` (each independent -
+    a SUPPORT_BREAK, bearish direction, seeds a "SUPPORT_TRAP" attempt; a
+    RESISTANCE_BREAK, bullish direction, seeds a "RESISTANCE_TRAP" attempt):
+
+    1. `broken_level` = the break event's `price`.
+    2. **First extreme (E1)**: the next confirmed swing of the matching type
+       after the break bar (a swing LOW after a SUPPORT_BREAK, a swing HIGH
+       after a RESISTANCE_BREAK). This becomes the trap's `stop_loss_reference`.
+       No such swing yet -> this break hasn't produced a trap (yet).
+    3. **Bounce**: the next confirmed swing of the OPPOSITE type after E1 -
+       confirms price actually moved away from E1 rather than grinding straight
+       through it.
+    4. **Second extreme (E2)**: the next confirmed swing of the SAME type as E1,
+       after the bounce. Must be "nearby" E1 - within `max_trap_retest_distance`
+       - unless E2 is actually *inside* E1 (a higher low after a SUPPORT_BREAK, a
+       lower high after a RESISTANCE_BREAK), which is always accepted regardless
+       of distance (that's a shallower retest, not a further breakdown). If E2
+       instead *extends past* E1 (a lower low / higher high) by more than
+       `max_trap_retest_distance`, the setup is abandoned - that reads as
+       continuation, not a failed retest.
+    5. **Reclaim**: the first bar at or after E2 whose `close` lands back on the
+       original side of `broken_level`. Only reported when that first-reclaiming
+       bar is the *last* bar in `window` - mirroring detect_fakeout's own "only
+       checks the most recent candle" scoping, so this function always answers
+       "did something confirm right now," not "did something ever confirm
+       somewhere in this lookback window."
+
+    Returns `{"type": "SUPPORT_TRAP" | "RESISTANCE_TRAP", "direction": "bullish"
+    | "bearish", "broken_level": float, "stop_loss_reference": float (E1's
+    price), "first_extreme_index": int, "index": int, "time": str | None}` for
+    whichever break (if any) completes its full 5-step sequence with its reclaim
+    landing exactly on the last bar, or `None`. Naming note: deliberately
+    "SUPPORT_TRAP"/"RESISTANCE_TRAP" (named after which level broke), not the
+    trader-jargon "bull trap"/"bear trap" - those terms are named after which
+    side gets trapped, which is the *opposite* of the break direction, and
+    mixing the two naming conventions invites exactly the kind of mislabeling
+    bug this project has already hit once (see detect_bos_choch's BOS/CHoCH
+    labeling divergence note)."""
+    n = len(window)
+    if not trendline_breaks:
         return None
+
+    closes = window["close"].to_numpy(dtype=float)
+    times = _all_time_strs(window)
+    swings_sorted = sorted(swings, key=lambda s: s["index"])
+    last_index = n - 1
+
+    for brk in trendline_breaks:
+        break_index = brk["index"]
+        broken_level = brk["price"]
+        is_support_break = brk["type"] == "SUPPORT_BREAK"
+        extreme_type = "low" if is_support_break else "high"
+        bounce_type = "high" if is_support_break else "low"
+
+        after_break = [s for s in swings_sorted if s["index"] > break_index]
+        e1 = next((s for s in after_break if s["type"] == extreme_type), None)
+        if e1 is None:
+            continue
+
+        after_e1 = [s for s in after_break if s["index"] > e1["index"]]
+        bounce = next((s for s in after_e1 if s["type"] == bounce_type), None)
+        if bounce is None:
+            continue
+
+        after_bounce = [s for s in after_e1 if s["index"] > bounce["index"]]
+        e2 = next((s for s in after_bounce if s["type"] == extreme_type), None)
+        if e2 is None:
+            continue
+
+        extends_past_e1 = (e2["price"] < e1["price"]) if is_support_break else (e2["price"] > e1["price"])
+        if extends_past_e1 and abs(e2["price"] - e1["price"]) > max_trap_retest_distance:
+            continue  # further continuation past E1, not a nearby failed retest
+
+        reclaim_index = None
+        for i in range(e2["index"], n):
+            close = closes[i]
+            if is_support_break and close > broken_level:
+                reclaim_index = i
+                break
+            if not is_support_break and close < broken_level:
+                reclaim_index = i
+                break
+        if reclaim_index != last_index:
+            continue  # either never reclaimed, or reclaimed on a now-stale bar
+
+        return {
+            "type": "SUPPORT_TRAP" if is_support_break else "RESISTANCE_TRAP",
+            "direction": "bullish" if is_support_break else "bearish",
+            "broken_level": float(broken_level),
+            "stop_loss_reference": float(e1["price"]),
+            "first_extreme_index": e1["index"],
+            "index": reclaim_index,
+            "time": times[reclaim_index],
+        }
+
+    return None
+
+
+def detect_fakeout(
+    window: pd.DataFrame,
+    swings: list[dict[str, Any]],
+    right_bars: int = 3,
+    trendline_points: int = DEFAULT_TRENDLINE_POINTS,
+    max_trap_retest_distance: float = DEFAULT_MAX_TRAP_RETEST_DISTANCE,
+    trendline: dict[str, Any] | None = None,
+    channel: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Liquidity sweep / fakeout (existing concept, generalized) plus trap
+    detection (new) - Phase 4 of the 2026-09 detector rebuild. Returns
+    `{"fakeout": {...} | None, "trap": {...} | None}` - a **breaking output-shape
+    change** from the prior single-dict-or-None return (this module's docstring
+    already documents this rebuild as behavior-change-by-design, not
+    bit-identical-preserving).
+
+    **Fakeout, generalized beyond the single most-recent raw swing level.**
+    Still only examines the last two candles (`curr = window.iloc[-1]`, `prev =
+    window.iloc[-2]`) - that structural "2 candles, no configurable window"
+    constraint is unchanged. What changed is *which levels* count: previously
+    only the single most recent confirmed swing low/high; now also the current
+    Phase 2 trendline (`detect_trendline`'s `support`/`resistance`, evaluated at
+    the last bar) and the current Phase 3 channel's *derived* boundaries (the
+    ascending channel's upper boundary, the descending channel's lower boundary
+    - the two that AREN'T already identical to the trendline values). Checked in
+    a fixed priority order - swing, then trendline, then channel - and the first
+    level that matches wins; this is a deliberate, documented tie-break (multiple
+    levels often sit close together and could all match the same 2-candle sweep),
+    not an attempt to report all of them.
+
+    **Role change - the single biggest behavioral change in this rebuild.**
+    Before this rebuild, `signals/smc_aggregator.py` used this detector's output
+    **only as a veto**: a fakeout opposing an already-tentative direction forced
+    that direction to `NEUTRAL`, and a fakeout *agreeing* with the tentative
+    direction did nothing at all - not a vote, not a confirmation. Phase 5 (the
+    aggregator rewire) makes fakeout/trap a **genuine fifth confluence vote**,
+    on equal footing with order block / FVG / trendline / channel - it can now
+    independently push the confluence score toward BULLISH or BEARISH on its
+    own, not just cancel an existing call. This function's job is unchanged
+    (detection only, no aggregation logic here), but what compute_smc_features'
+    caller *does* with this output is fundamentally different starting Phase 5 -
+    see signals/smc_aggregator.py and its own module docstring for the new
+    aggregation model once that phase lands.
+
+    See `_detect_trap` above for the trap pattern's full state-machine
+    documentation, including why it's scoped to trendline breaks specifically
+    rather than the same 3-source generalization the fakeout check above gets.
+
+    `trendline`/`channel`: precomputed `detect_trendline`/`detect_channel`
+    results, or `None` to compute them here. `compute_smc_features` passes its
+    own already-computed values in - same shared-computation pattern
+    `detect_order_blocks`/`detect_fvg` use for `atr` - since without it,
+    `compute_smc_features` would end up building 4 `_TrendlineTracker`
+    instances per call (2 direct + 2 more inside this function) instead of 2."""
+    result: dict[str, Any] = {"fakeout": None, "trap": None}
+    n = len(window)
+    if n < 3 or not swings:
+        return result
+
+    if trendline is None:
+        trendline = detect_trendline(window, swings, right_bars=right_bars, trendline_points=trendline_points)
+    if channel is None:
+        channel = detect_channel(window, swings, right_bars=right_bars, trendline_points=trendline_points)
 
     curr = window.iloc[-1]
     prev = window.iloc[-2]
-    i = len(window) - 1
+    i = n - 1
     ts = _time_str(window, i)
 
+    support_levels: list[tuple[str, float]] = []
     recent_lows = [s for s in swings if s["type"] == "low"]
     if recent_lows:
-        last_low = recent_lows[-1]["price"]
-        if float(prev["low"]) < last_low and float(curr["close"]) > last_low:
-            return {"type": "BULL_FAKEOUT", "swept_level": last_low, "index": i, "time": ts}
+        support_levels.append(("swing", recent_lows[-1]["price"]))
+    if trendline["support"] is not None:
+        support_levels.append(("trendline", trendline["support"]["value_at_last_index"]))
+    if channel["descending"] is not None:
+        support_levels.append(("channel", channel["descending"]["lower"]["value_at_last_index"]))
 
+    resistance_levels: list[tuple[str, float]] = []
     recent_highs = [s for s in swings if s["type"] == "high"]
     if recent_highs:
-        last_high = recent_highs[-1]["price"]
-        if float(prev["high"]) > last_high and float(curr["close"]) < last_high:
-            return {"type": "BEAR_FAKEOUT", "swept_level": last_high, "index": i, "time": ts}
+        resistance_levels.append(("swing", recent_highs[-1]["price"]))
+    if trendline["resistance"] is not None:
+        resistance_levels.append(("trendline", trendline["resistance"]["value_at_last_index"]))
+    if channel["ascending"] is not None:
+        resistance_levels.append(("channel", channel["ascending"]["upper"]["value_at_last_index"]))
 
-    return None
+    for source, level in support_levels:
+        if float(prev["low"]) < level and float(curr["close"]) > level:
+            result["fakeout"] = {
+                "type": "BULL_FAKEOUT", "source": source, "swept_level": float(level),
+                "index": i, "time": ts,
+            }
+            break
+
+    if result["fakeout"] is None:
+        for source, level in resistance_levels:
+            if float(prev["high"]) > level and float(curr["close"]) < level:
+                result["fakeout"] = {
+                    "type": "BEAR_FAKEOUT", "source": source, "swept_level": float(level),
+                    "index": i, "time": ts,
+                }
+                break
+
+    result["trap"] = _detect_trap(window, swings, trendline["breaks"], max_trap_retest_distance)
+    return result
 
 
 # TODO: 90 was tuned for daily stock bars (~4 months of history) in tradingagents-kr.
@@ -833,6 +1043,7 @@ def compute_smc_features(
     trendline_points: int = DEFAULT_TRENDLINE_POINTS,
     min_trendline_break_distance: float = DEFAULT_MIN_TRENDLINE_BREAK_DISTANCE,
     min_channel_break_distance: float = DEFAULT_MIN_CHANNEL_BREAK_DISTANCE,
+    max_trap_retest_distance: float = DEFAULT_MAX_TRAP_RETEST_DISTANCE,
 ) -> dict[str, Any]:
     """OHLCV DataFrame -> SMC structure feature dict. Pure computation, no
     buy/sell judgment (see signals/smc_aggregator.py for that)."""
@@ -873,7 +1084,10 @@ def compute_smc_features(
         min_break_distance=min_trendline_break_distance,
         min_channel_break_distance=min_channel_break_distance,
     )
-    fakeout = detect_fakeout(window, swings)
+    fakeout = detect_fakeout(
+        window, swings, right_bars=swing_right_bars, trendline_points=trendline_points,
+        max_trap_retest_distance=max_trap_retest_distance, trendline=trendline, channel=channel,
+    )
 
     return {
         "lookback_bars": len(window),
