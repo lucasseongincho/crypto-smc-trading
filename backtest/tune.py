@@ -123,10 +123,15 @@ class GridPoint:
     min_break_distance: float
 
 
-def _run_point(point: GridPoint, df: pd.DataFrame) -> dict[str, Any]:
+def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) -> dict[str, Any]:
     """Runs one parameter combination's backtest against df and returns its
     params + full trade-level metrics as a single flat dict - the row shape both
-    run_search() and evaluate_holdout() produce."""
+    run_search() and evaluate_holdout() produce.
+
+    allow_short defaults to False (the only executable-on-Kraken-Spot mode) and
+    must only ever be set True from run_diagnostic_long_short() below - see that
+    function's docstring and backtest/runner.py's FillEngine.allow_short docstring
+    for why this is diagnostic-only, never a real trading mode."""
     aggregator = SMCSignalAggregator(min_confluence=point.min_confluence)
     risk = RiskManager(initial_balance=INITIAL_BALANCE)
     result = run_backtest(
@@ -134,12 +139,18 @@ def _run_point(point: GridPoint, df: pd.DataFrame) -> dict[str, Any]:
         min_ob_body_ratio=point.min_ob_body_ratio,
         min_fvg_gap_ratio=point.min_fvg_gap_ratio,
         min_break_distance=point.min_break_distance,
+        allow_short=allow_short,
     )
     return {
         "min_confluence": point.min_confluence,
         "min_ob_body_ratio": point.min_ob_body_ratio,
         "min_fvg_gap_ratio": point.min_fvg_gap_ratio,
         "min_break_distance": point.min_break_distance,
+        # Always computed (cheap, harmless when allow_short=False - short_trades
+        # is just always 0 then) so the long+short diagnostic can report the split
+        # without a separate code path.
+        "long_trades": sum(1 for t in result.trades if t.side == "BUY"),
+        "short_trades": sum(1 for t in result.trades if t.side == "SELL"),
         **result.metrics(),
     }
 
@@ -147,16 +158,18 @@ def _run_point(point: GridPoint, df: pd.DataFrame) -> dict[str, Any]:
 # Populated once per worker process by _init_worker() - avoids each of the 256
 # grid-point tasks reloading/re-slicing the ~100MB snapshot CSV independently.
 _worker_df: pd.DataFrame | None = None
+_worker_allow_short: bool = False
 
 
-def _init_worker(snapshot_path: Path, start: str, end: str) -> None:
-    global _worker_df
+def _init_worker(snapshot_path: Path, start: str, end: str, allow_short: bool = False) -> None:
+    global _worker_df, _worker_allow_short
     full = load_snapshot(snapshot_path)
     _worker_df = full.loc[start:end]
+    _worker_allow_short = allow_short
 
 
 def _run_point_in_worker(point: GridPoint) -> dict[str, Any]:
-    return _run_point(point, _worker_df)
+    return _run_point(point, _worker_df, allow_short=_worker_allow_short)
 
 
 def build_grid() -> list[GridPoint]:
@@ -173,18 +186,25 @@ def run_search(
     start: str = TUNING_START,
     end: str = TUNING_END,
     max_workers: int | None = None,
+    allow_short: bool = False,
 ) -> list[dict[str, Any]]:
     """Runs the full coarse grid against [start, end) of snapshot_path, in parallel
     across worker processes. Returns every combination's result row - the full
     distribution, not a filtered top-N (that's the caller's job, e.g.
-    write_tuning_log() below)."""
+    write_tuning_log() below).
+
+    allow_short defaults to False (the real, executable-on-Kraken-Spot mode this
+    project runs in). It exists here only so run_diagnostic_long_short() can reuse
+    this same parallel search machinery for its long+short comparison - the default
+    CLI action (`python -m backtest.tune`) never passes True."""
     grid = build_grid()
-    print(f"Running {len(grid)} grid points over {start} -> {end} ...")
+    label = "long+short (DIAGNOSTIC)" if allow_short else "long-only"
+    print(f"Running {len(grid)} grid points ({label}) over {start} -> {end} ...")
 
     results: list[dict[str, Any]] = []
     t0 = time.time()
     with ProcessPoolExecutor(
-        max_workers=max_workers, initializer=_init_worker, initargs=(snapshot_path, start, end),
+        max_workers=max_workers, initializer=_init_worker, initargs=(snapshot_path, start, end, allow_short),
     ) as pool:
         futures = [pool.submit(_run_point_in_worker, point) for point in grid]
         for i, future in enumerate(as_completed(futures), start=1):
@@ -201,6 +221,38 @@ def run_search(
 
     print(f"Done in {time.time() - t0:.1f}s.")
     return results
+
+
+def run_diagnostic_long_short(
+    snapshot_path: Path = DEFAULT_SNAPSHOT,
+    start: str = TUNING_START,
+    end: str = TUNING_END,
+    max_workers: int | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Runs the full grid twice over the identical period - once long-only
+    (allow_short=False, the only mode this project ever actually trades in) and
+    once with shorts additionally enabled (allow_short=True) - to measure how much
+    of the long-only result is attributable to missing the short side of this
+    window's whipsaw, rather than to the strategy's entries/exits being wrong.
+
+    Re-runs the long-only leg fresh here rather than reusing the numbers already
+    committed in docs/tuning-log.md, so the comparison is guaranteed apples-to-
+    apples against the exact same code path in the same process, not parsed back
+    out of already-rounded markdown.
+
+    **DIAGNOSTIC ONLY.** Kraken Spot has no margin and cannot open a short position
+    at all. This function - and the allow_short=True leg specifically - is never
+    called from live/trader.py or viz/control.py's paper trading, and never will
+    be; see FillEngine.allow_short's docstring in backtest/runner.py. If this
+    comparison shows shorts meaningfully changing the picture, that's a signal to
+    revisit the Spot-vs-Margin/Futures venue decision later - not something to
+    wire into execution off the back of this diagnostic alone.
+    """
+    print("=== Diagnostic leg 1/2: long-only (real, executable mode) ===")
+    long_only = run_search(snapshot_path, start, end, max_workers, allow_short=False)
+    print("=== Diagnostic leg 2/2: long+short (DIAGNOSTIC ONLY - not executable on Kraken Spot) ===")
+    long_short = run_search(snapshot_path, start, end, max_workers, allow_short=True)
+    return long_only, long_short
 
 
 def evaluate_holdout(
@@ -292,17 +344,32 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
     return "\n".join(lines)
 
 
+# The log file is always written in this section order: grid search results,
+# then (if it's ever been run) the long+short diagnostic, then (if it's ever been
+# run) holdout evaluations. Every writer below preserves whichever of these
+# sections it isn't itself responsible for, found by these markers - never by
+# slicing a formatted row string (see the "Caught and fixed a real bug" note in
+# this project's git history for why that's specifically disallowed here).
+_DIAGNOSTIC_MARKER = "\n## Diagnostic: long+short"
+_HOLDOUT_MARKER = "\n## Holdout evaluations"
+
+
+def _find_earliest_marker(text: str, markers: list[str]) -> int:
+    """Position of whichever marker appears first in text, or len(text) if none do."""
+    positions = [p for p in (text.find(m) for m in markers) if p != -1]
+    return min(positions) if positions else len(text)
+
+
 def write_tuning_log(results: list[dict[str, Any]], start: str, end: str, path: Path = TUNING_LOG_PATH) -> None:
-    """Writes the grid search section fresh, but preserves any existing '## Holdout
-    evaluations' section already in the file (from prior --evaluate-holdout runs) -
-    re-running the search must not erase a past holdout check's record."""
+    """Writes the grid search section fresh, but preserves any existing diagnostic
+    and/or holdout sections already in the file (from prior --diagnostic-allow-short
+    or --evaluate-holdout runs, in either order) - re-running the search must not
+    erase either record."""
     preserved_tail = ""
     if path.exists():
         existing = path.read_text(encoding="utf-8")
-        marker = "\n## Holdout evaluations"
-        idx = existing.find(marker)
-        if idx != -1:
-            preserved_tail = existing[idx:]
+        cut = _find_earliest_marker(existing, [_DIAGNOSTIC_MARKER, _HOLDOUT_MARKER])
+        preserved_tail = existing[cut:]
 
     header = (
         "# Parameter tuning log\n\n"
@@ -312,6 +379,81 @@ def write_tuning_log(results: list[dict[str, Any]], start: str, end: str, path: 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(header + "\n" + _grid_search_section(results, start, end) + "\n" + preserved_tail, encoding="utf-8")
     print(f"Wrote {path}")
+
+
+def _diagnostic_short_section_text(
+    long_only: list[dict[str, Any]], long_short: list[dict[str, Any]], start: str, end: str,
+) -> str:
+    key = lambda r: (r["min_confluence"], r["min_ob_body_ratio"], r["min_fvg_gap_ratio"], r["min_break_distance"])
+    by_long_only = {key(r): r for r in long_only}
+    by_long_short = {key(r): r for r in long_short}
+    paired_keys = sorted(by_long_only.keys() & by_long_short.keys())
+
+    long_only_rois = [by_long_only[k]["roi_pct"] for k in paired_keys]
+    long_short_rois = [by_long_short[k]["roi_pct"] for k in paired_keys]
+    roi_deltas = [by_long_short[k]["roi_pct"] - by_long_only[k]["roi_pct"] for k in paired_keys]
+
+    lines = [
+        "## Diagnostic: long+short (BACKTEST ONLY - not executable on Kraken Spot)",
+        "",
+        "**This is not a trading mode.** Kraken Spot has no margin and cannot open a short "
+        "position at all - `live/trader.py` and paper trading (`viz/control.py`) never enable "
+        "this and never will (see `FillEngine.allow_short`'s docstring in `backtest/runner.py`). "
+        "This section exists only to measure how much of the long-only result above is "
+        "attributable to missing the short side of this window's whipsaw, not to propose actually "
+        "shorting on this venue. If shorts meaningfully change the picture, that's a signal to "
+        "revisit the Spot-vs-Margin/Futures venue decision later - not something to wire into "
+        "execution off the back of this diagnostic alone.",
+        "",
+        f"Same grid, same period (**{start} -> {end}**), same {len(paired_keys)} combinations - the only "
+        "difference is BEARISH signals are additionally allowed to open a simulated short instead of "
+        "being discarded.",
+        "",
+        f"- Best ROI: long-only {max(long_only_rois):.2f}% vs. long+short {max(long_short_rois):.2f}%",
+        f"- Median ROI: long-only {statistics.median(long_only_rois):.2f}% vs. long+short "
+        f"{statistics.median(long_short_rois):.2f}%",
+        f"- Median ROI delta (long+short minus long-only), across all {len(paired_keys)} paired "
+        f"combinations: {statistics.median(roi_deltas):+.2f} points",
+        f"- Combinations where long+short beat long-only: {sum(1 for d in roi_deltas if d > 0)}/{len(paired_keys)}",
+        "",
+        "| Conf | OB ratio | FVG ratio | Break $ | Long-only ROI% | Long+short ROI% | Δ ROI (pts) | "
+        "Long+short trades (long/short) |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for k in sorted(paired_keys, key=lambda k: by_long_short[k]["roi_pct"] - by_long_only[k]["roi_pct"], reverse=True):
+        lo, ls = by_long_only[k], by_long_short[k]
+        delta = ls["roi_pct"] - lo["roi_pct"]
+        lines.append(
+            f"| {k[0]} | {k[1]:.2f} | {k[2]:.2f} | {k[3]:.1f} | {lo['roi_pct']:.2f} | {ls['roi_pct']:.2f} | "
+            f"{delta:+.2f} | {ls['total_trades']} ({ls['long_trades']}/{ls['short_trades']}) |"
+        )
+    return "\n".join(lines)
+
+
+def write_diagnostic_short_section(
+    long_only: list[dict[str, Any]], long_short: list[dict[str, Any]], start: str, end: str,
+    path: Path = TUNING_LOG_PATH,
+) -> None:
+    """Writes/replaces the '## Diagnostic: long+short' section, preserving the
+    grid-search section before it and the holdout section after it (in either
+    presence/absence combination) - never called automatically, only from the
+    --diagnostic-allow-short CLI path."""
+    existing = path.read_text(encoding="utf-8") if path.exists() else "# Parameter tuning log\n"
+
+    diag_start = existing.find(_DIAGNOSTIC_MARKER)
+    if diag_start != -1:
+        # Replace a prior diagnostic run rather than duplicating it.
+        holdout_after_diag = existing.find(_HOLDOUT_MARKER, diag_start + 1)
+        head = existing[:diag_start]
+        tail = existing[holdout_after_diag:] if holdout_after_diag != -1 else ""
+    else:
+        holdout_start = existing.find(_HOLDOUT_MARKER)
+        head = existing[:holdout_start] if holdout_start != -1 else existing
+        tail = existing[holdout_start:] if holdout_start != -1 else ""
+
+    section = _diagnostic_short_section_text(long_only, long_short, start, end)
+    path.write_text(head.rstrip("\n") + "\n\n" + section + "\n\n" + tail.lstrip("\n"), encoding="utf-8")
+    print(f"Wrote diagnostic long+short section to {path}")
 
 
 def append_holdout_result(row: dict[str, Any], start: str, end: str, path: Path = TUNING_LOG_PATH) -> None:
@@ -354,6 +496,13 @@ def main() -> None:
         help="Run ONE combination against the held-out period instead of the grid search. "
              "Requires --min-confluence/--min-ob-body-ratio/--min-fvg-gap-ratio/--min-break-distance.",
     )
+    parser.add_argument(
+        "--diagnostic-allow-short", action="store_true",
+        help="Re-run the full grid twice (long-only and long+short) over the tuning period and write a "
+             "comparison to docs/tuning-log.md. DIAGNOSTIC ONLY - Kraken Spot cannot execute short "
+             "positions; this never affects live/trader.py or paper trading. See "
+             "run_diagnostic_long_short()'s docstring.",
+    )
     parser.add_argument("--min-confluence", type=int)
     parser.add_argument("--min-ob-body-ratio", type=float)
     parser.add_argument("--min-fvg-gap-ratio", type=float)
@@ -381,6 +530,16 @@ def main() -> None:
         for key, label, fmt in _METRIC_COLUMNS:
             print(f"  {label:>7}: {fmt.format(row[key])}")
         append_holdout_result(row, HOLDOUT_START, HOLDOUT_END)
+        return
+
+    if args.diagnostic_allow_short:
+        print(
+            "Running the DIAGNOSTIC long+short comparison - this re-runs the full grid twice "
+            "(long-only, then long+short) and is not a trading mode. See "
+            "run_diagnostic_long_short()'s docstring."
+        )
+        long_only, long_short = run_diagnostic_long_short(snapshot_path=args.snapshot, max_workers=args.max_workers)
+        write_diagnostic_short_section(long_only, long_short, TUNING_START, TUNING_END)
         return
 
     results = run_search(snapshot_path=args.snapshot, max_workers=args.max_workers)

@@ -143,11 +143,22 @@ class FillEngine:
     on a closed candle's close can only fill at the *next* candle's open (no
     same-bar lookahead) - so a signal fires on on_candle(bar_i) and actually enters
     on the following on_candle(bar_i+1) call, using that call's open price. Kraken
-    spot has no margin/shorting, so a BEARISH signal while flat is skipped rather
-    than opened as a short (see live/trader.py for the execution-side version of the
-    same constraint); a BEARISH signal while already long is not treated as an exit
-    signal either (exits are SL/TP only) - a real simplification worth revisiting
-    once enough trades exist to check whether early SMC-driven exits would help.
+    spot has no margin/shorting, so by default a BEARISH signal while flat is
+    skipped rather than opened as a short (see live/trader.py for the
+    execution-side version of the same constraint); a BEARISH signal while already
+    long is not treated as an exit signal either (exits are SL/TP only) - a real
+    simplification worth revisiting once enough trades exist to check whether early
+    SMC-driven exits would help.
+
+    allow_short (default False) exists ONLY to diagnose how much of a backtest
+    result is attributable to a long-only strategy missing the short side of a
+    whipsaw/downtrending regime - see docs/tuning-log.md's "Diagnostic: long+short"
+    section. **This is not an executable trading mode.** Kraken Spot cannot open a
+    short position at all (no margin), so live/trader.py and viz/control.py's paper
+    trading must never pass allow_short=True - doing so would model trades the
+    exchange this project targets cannot actually place. Nothing in this codebase
+    outside backtest/tune.py's explicit diagnostic path sets it to True; it is not
+    exposed as a dashboard or CLI backtest option for that reason.
 
     run_backtest() below drives this over a static historical DataFrame; paper
     trading (viz/control.py) drives the same on_candle() one live candle at a time.
@@ -168,6 +179,7 @@ class FillEngine:
         min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
         min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
         min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
+        allow_short: bool = False,
     ):
         self.aggregator = aggregator
         self.risk = risk
@@ -176,6 +188,7 @@ class FillEngine:
         self.min_ob_body_ratio = min_ob_body_ratio
         self.min_fvg_gap_ratio = min_fvg_gap_ratio
         self.min_break_distance = min_break_distance
+        self.allow_short = allow_short
 
         self._window: deque[tuple[Any, float, float, float, float]] = deque(maxlen=lookback_bars)
         self.position: Position | None = None
@@ -227,7 +240,15 @@ class FillEngine:
             self._pending_signal = signal
             self._pending_features = features
             self._pending_current_price = close
-        # BEARISH: no short-selling on spot - skip. NEUTRAL: nothing to do.
+        elif signal.direction == "BEARISH" and self.allow_short:
+            # Diagnostic-only path - see FillEngine's allow_short docstring. Never
+            # true for live/paper (they never pass allow_short=True).
+            self._pending_side = "SELL"
+            self._pending_signal = signal
+            self._pending_features = features
+            self._pending_current_price = close
+        # BEARISH with allow_short=False (the default, and the only mode live/paper
+        # ever run in): no short-selling on spot - skip. NEUTRAL: nothing to do.
 
     def _enter(self, time: Any, open_price: float) -> dict[str, Any] | None:
         side = self._pending_side
@@ -258,17 +279,31 @@ class FillEngine:
         exit_price_raw = None
         reason = None
 
-        if low <= pos.stop_loss:
-            exit_price_raw, reason = pos.stop_loss, "SL"
-        elif high >= pos.take_profit:
-            exit_price_raw, reason = pos.take_profit, "TP"
+        if pos.side == "BUY":
+            # Long: stop is below entry, target is above.
+            if low <= pos.stop_loss:
+                exit_price_raw, reason = pos.stop_loss, "SL"
+            elif high >= pos.take_profit:
+                exit_price_raw, reason = pos.take_profit, "TP"
+            close_action = "SELL"
+        else:
+            # Short (diagnostic-only, allow_short=True - see FillEngine's
+            # docstring): stop is above entry, target is below - mirror image.
+            if high >= pos.stop_loss:
+                exit_price_raw, reason = pos.stop_loss, "SL"
+            elif low <= pos.take_profit:
+                exit_price_raw, reason = pos.take_profit, "TP"
+            close_action = "BUY"
 
         if not reason:
             return None
 
-        exit_price = _fill_price(exit_price_raw, "SELL", self.fill_config.slippage_bps)
+        exit_price = _fill_price(exit_price_raw, close_action, self.fill_config.slippage_bps)
         exit_fee = exit_price * pos.size * self.fill_config.taker_fee_pct
-        gross = (exit_price - pos.entry_price) * pos.size
+        gross = (
+            (exit_price - pos.entry_price) * pos.size if pos.side == "BUY"
+            else (pos.entry_price - exit_price) * pos.size
+        )
         pnl = gross - pos.entry_fee - exit_fee
         risk_amount = abs(pos.entry_price - pos.stop_loss) * pos.size
         r_multiple = pnl / risk_amount if risk_amount else 0.0
@@ -298,15 +333,19 @@ def run_backtest(
     min_ob_body_ratio: float = DEFAULT_MIN_OB_BODY_RATIO,
     min_fvg_gap_ratio: float = DEFAULT_MIN_FVG_GAP_RATIO,
     min_break_distance: float = DEFAULT_MIN_BREAK_DISTANCE,
+    allow_short: bool = False,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     progress_every: int = 200,
 ) -> BacktestResult:
-    """Drives FillEngine over a static historical DataFrame."""
+    """Drives FillEngine over a static historical DataFrame. allow_short defaults to
+    False and must stay False for anything meant to reflect real executable
+    behavior - see FillEngine's docstring; it exists only for
+    backtest/tune.py's explicit long-vs-long+short diagnostic."""
     initial_balance = risk.current_balance
     engine = FillEngine(
         aggregator, risk, fill_config, lookback_bars,
         min_ob_body_ratio=min_ob_body_ratio, min_fvg_gap_ratio=min_fvg_gap_ratio,
-        min_break_distance=min_break_distance,
+        min_break_distance=min_break_distance, allow_short=allow_short,
     )
     n = len(df)
 

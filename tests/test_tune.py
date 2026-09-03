@@ -19,6 +19,7 @@ from backtest.tune import (
     _run_point,
     append_holdout_result,
     build_grid,
+    write_diagnostic_short_section,
     write_tuning_log,
 )
 
@@ -132,6 +133,78 @@ class TestWriteTuningLog(unittest.TestCase):
 
         self.assertIn("Holdout evaluations", content_after)
         self.assertIn("Grid search results", content_after)
+
+
+def _sample_row(**overrides) -> dict:
+    row = {"min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5, "min_break_distance": 50.0,
+           "total_trades": 12, "long_trades": 12, "short_trades": 0, "win_rate_pct": 50.0, "profit_factor": 1.5,
+           "total_pnl": 200.0, "roi_pct": 1.0, "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4,
+           "median_r_multiple": 0.3, "std_r_multiple": 0.2, "buy_hold_return_pct": 2.0}
+    row.update(overrides)
+    return row
+
+
+class TestDiagnosticShortSectionOrderingIsPreservedBothWays(unittest.TestCase):
+    """The log has up to three sections that can each be (re)written independently
+    and in any order the CLI happens to be used: grid search, diagnostic
+    long+short, holdout evaluations. Each writer must preserve the sections it
+    isn't responsible for, regardless of which order they were created in - this
+    is exactly the class of bug a prior string-slicing mistake in this same file
+    already produced once, so it's covered directly rather than just by "does the
+    word appear somewhere" checks."""
+
+    def test_diagnostic_written_after_holdout_is_inserted_before_it_not_after(self):
+        long_only = [_sample_row(min_confluence=3)]
+        long_short = [_sample_row(min_confluence=3, roi_pct=-2.0, short_trades=4, total_trades=16, long_trades=12)]
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log(long_only, "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+            write_diagnostic_short_section(long_only, long_short, "2025-04-01", "2025-12-31", path=path)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("Grid search results", content)
+        self.assertIn("Diagnostic: long+short", content)
+        self.assertIn("Holdout evaluations", content)
+        # Canonical order: grid, then diagnostic, then holdout - regardless of the
+        # order the CLI commands were actually run in.
+        self.assertLess(content.index("Grid search results"), content.index("Diagnostic: long+short"))
+        self.assertLess(content.index("Diagnostic: long+short"), content.index("Holdout evaluations"))
+
+    def test_rerunning_diagnostic_replaces_the_old_one_without_duplicating(self):
+        long_only = [_sample_row(min_confluence=3)]
+        long_short_v1 = [_sample_row(min_confluence=3, roi_pct=-2.0, short_trades=4, total_trades=16)]
+        long_short_v2 = [_sample_row(min_confluence=3, roi_pct=-9.0, short_trades=9, total_trades=21)]
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log(long_only, "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+            write_diagnostic_short_section(long_only, long_short_v1, "2025-04-01", "2025-12-31", path=path)
+            write_diagnostic_short_section(long_only, long_short_v2, "2025-04-01", "2025-12-31", path=path)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertEqual(content.count("Diagnostic: long+short"), 1)  # not duplicated
+        self.assertIn("-9.00", content)  # the second (latest) run's numbers
+        self.assertIn("Holdout evaluations", content)  # still preserved
+
+    def test_rerunning_the_grid_search_preserves_both_diagnostic_and_holdout(self):
+        long_only = [_sample_row(min_confluence=3)]
+        long_short = [_sample_row(min_confluence=3, roi_pct=-2.0, short_trades=4, total_trades=16)]
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log(long_only, "2025-04-01", "2025-12-31", path=path)
+            write_diagnostic_short_section(long_only, long_short, "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+
+            write_tuning_log(long_only, "2025-04-01", "2025-12-31", path=path)  # re-run the search
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("Grid search results", content)
+        self.assertIn("Diagnostic: long+short", content)
+        self.assertIn("Holdout evaluations", content)
 
 
 class TestAppendHoldoutResult(unittest.TestCase):

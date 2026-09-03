@@ -6,12 +6,13 @@ grid search, which needs these to actually vary results, not just be accepted an
 silently ignored by the simulator.
 """
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
 from backtest.risk import RiskManager
-from backtest.runner import FillConfig, FillEngine, run_backtest
-from signals.smc_aggregator import SMCSignalAggregator
+from backtest.runner import FillConfig, FillEngine, Position, run_backtest
+from signals.smc_aggregator import SMCSignal, SMCSignalAggregator
 
 
 def _trending_ohlc(n: int = 80) -> pd.DataFrame:
@@ -59,6 +60,90 @@ class TestFillEngineThreadsDetectorParams(unittest.TestCase):
         self.assertEqual(engine.min_ob_body_ratio, 0.5)
         self.assertEqual(engine.min_fvg_gap_ratio, 0.5)
         self.assertEqual(engine.min_break_distance, 50.0)
+
+
+def _bearish_signal(confluence: int = -2) -> SMCSignal:
+    return SMCSignal(
+        direction="BEARISH", confluence_score=confluence, bullish_count=0, bearish_count=2,
+        veto=False, veto_reason=None,
+    )
+
+
+class TestShortSideIsDiagnosticOnly(unittest.TestCase):
+    """allow_short exists only for backtest/tune.py's long-vs-long+short
+    diagnostic (see docs/tuning-log.md) - live/trader.py and paper trading
+    (viz/control.py) never set it, so the default must stay exactly the current
+    long-only behavior."""
+
+    def _engine(self, allow_short: bool) -> FillEngine:
+        return FillEngine(
+            SMCSignalAggregator(min_confluence=1), RiskManager(initial_balance=10_000.0),
+            FillConfig(taker_fee_pct=0.0, slippage_bps=0.0), allow_short=allow_short,
+        )
+
+    @staticmethod
+    def _prime_window(engine: FillEngine) -> None:
+        # _evaluate_signal requires >= 2 candles before it even calls aggregate() -
+        # both tests below need this so the mocked BEARISH signal is actually reached.
+        engine._window.append((pd.Timestamp("2025-01-01", tz="utc"), 100.0, 101.0, 99.0, 100.0))
+        engine._window.append((pd.Timestamp("2025-01-01 00:05", tz="utc"), 100.0, 101.0, 99.0, 100.0))
+
+    def test_bearish_signal_is_ignored_by_default(self):
+        engine = self._engine(allow_short=False)
+        self._prime_window(engine)
+        with patch.object(engine.aggregator, "aggregate", return_value=_bearish_signal()) as mock_aggregate:
+            engine._evaluate_signal(close=100.0)
+        mock_aggregate.assert_called_once()  # confirms the branch was actually reached, not short-circuited
+        self.assertIsNone(engine._pending_side)
+
+    def test_bearish_signal_opens_a_pending_short_when_allowed(self):
+        engine = self._engine(allow_short=True)
+        self._prime_window(engine)
+        with patch.object(engine.aggregator, "aggregate", return_value=_bearish_signal()):
+            engine._evaluate_signal(close=100.0)
+        self.assertEqual(engine._pending_side, "SELL")
+
+    def test_short_stop_loss_triggers_when_price_rises_to_the_stop(self):
+        engine = self._engine(allow_short=True)
+        engine.position = Position(
+            side="SELL", entry_price=100.0, stop_loss=105.0, take_profit=91.0, size=1.0,
+            entry_time=pd.Timestamp("2025-01-01", tz="utc"), entry_fee=0.0, confluence=1,
+        )
+        event = engine._check_exit(pd.Timestamp("2025-01-01 00:05", tz="utc"), high=106.0, low=99.0)
+        self.assertEqual(event["reason"], "SL")
+        self.assertLess(engine.trades[-1].pnl, 0)  # short loses when price rises
+
+    def test_short_take_profit_triggers_when_price_falls_to_the_target(self):
+        engine = self._engine(allow_short=True)
+        engine.position = Position(
+            side="SELL", entry_price=100.0, stop_loss=105.0, take_profit=91.0, size=1.0,
+            entry_time=pd.Timestamp("2025-01-01", tz="utc"), entry_fee=0.0, confluence=1,
+        )
+        event = engine._check_exit(pd.Timestamp("2025-01-01 00:05", tz="utc"), high=100.0, low=90.0)
+        self.assertEqual(event["reason"], "TP")
+        self.assertGreater(engine.trades[-1].pnl, 0)  # short profits when price falls
+
+    def test_short_pnl_magnitude_matches_price_move_times_size(self):
+        engine = self._engine(allow_short=True)
+        engine.position = Position(
+            side="SELL", entry_price=100.0, stop_loss=105.0, take_profit=91.0, size=2.0,
+            entry_time=pd.Timestamp("2025-01-01", tz="utc"), entry_fee=0.0, confluence=1,
+        )
+        engine._check_exit(pd.Timestamp("2025-01-01 00:05", tz="utc"), high=100.0, low=90.0)
+        # Zero fees/slippage in this fixture, so pnl should be exactly (entry - exit) * size.
+        self.assertAlmostEqual(engine.trades[-1].pnl, (100.0 - 91.0) * 2.0)
+
+    def test_run_backtest_default_allow_short_false_matches_omitting_it(self):
+        """The new allow_short parameter must be purely additive - explicit False
+        must behave identically to not passing it at all."""
+        df = _trending_ohlc()
+        agg = SMCSignalAggregator(min_confluence=1)
+        result_omitted = run_backtest(df, agg, RiskManager(initial_balance=20_000.0), FillConfig())
+        result_explicit = run_backtest(
+            df, SMCSignalAggregator(min_confluence=1), RiskManager(initial_balance=20_000.0), FillConfig(),
+            allow_short=False,
+        )
+        self.assertEqual(len(result_omitted.trades), len(result_explicit.trades))
 
 
 if __name__ == "__main__":
