@@ -16,12 +16,19 @@ from backtest.tune import (
     MIN_CONFLUENCE_GRID,
     MIN_FVG_GAP_RATIO_GRID,
     MIN_OB_BODY_RATIO_GRID,
+    MIN_SL_DISTANCE_GRID,
     MIN_TRENDLINE_BREAK_DISTANCE_GRID,
+    RR_RATIO_GRID,
+    BEST_KNOWN_DETECTOR_POINT,
     GridPoint,
+    RiskGridPoint,
     _run_point,
+    _run_risk_point,
     append_holdout_result,
     build_grid,
+    build_risk_grid,
     write_diagnostic_short_section,
+    write_risk_grid_section,
     write_tuning_log,
 )
 
@@ -44,6 +51,17 @@ def _sample_row(**overrides) -> dict:
         "min_confluence": 3, "min_ob_body_ratio": 0.5, "min_fvg_gap_ratio": 0.5,
         "min_trendline_break_distance": 50.0, "min_channel_break_distance": 50.0,
         "max_trap_retest_distance": 100.0,
+        "total_trades": 12, "long_trades": 12, "short_trades": 0, "win_rate_pct": 50.0, "profit_factor": 1.5,
+        "total_pnl": 200.0, "roi_pct": 1.0, "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4,
+        "median_r_multiple": 0.3, "std_r_multiple": 0.2, "buy_hold_return_pct": 2.0,
+    }
+    row.update(overrides)
+    return row
+
+
+def _sample_risk_row(**overrides) -> dict:
+    row = {
+        "rr_ratio": 1.5, "min_sl_distance": 50.0,
         "total_trades": 12, "long_trades": 12, "short_trades": 0, "win_rate_pct": 50.0, "profit_factor": 1.5,
         "total_pnl": 200.0, "roi_pct": 1.0, "max_drawdown_pct": 3.0, "avg_r_multiple": 0.4,
         "median_r_multiple": 0.3, "std_r_multiple": 0.2, "buy_hold_return_pct": 2.0,
@@ -232,6 +250,117 @@ class TestDiagnosticShortSectionOrderingIsPreservedBothWays(unittest.TestCase):
 
         self.assertIn("Grid search results", content)
         self.assertIn("Diagnostic: long+short", content)
+        self.assertIn("Holdout evaluations", content)
+
+
+class TestBuildRiskGrid(unittest.TestCase):
+    def test_grid_size_matches_the_product_of_both_risk_parameter_lists(self):
+        self.assertEqual(len(build_risk_grid()), len(RR_RATIO_GRID) * len(MIN_SL_DISTANCE_GRID))
+
+    def test_grid_size_is_16(self):
+        # 4 rr_ratio values x 4 min_sl_distance values, per the module docstring's
+        # "3-4 values each" - locks the literal count so a silent grid-size change
+        # is caught here, not just via the product-matches-lists check above.
+        self.assertEqual(len(build_risk_grid()), 16)
+
+    def test_rr_ratio_grid_includes_the_shipped_default(self):
+        self.assertIn(1.5, RR_RATIO_GRID)
+
+    def test_min_sl_distance_grid_includes_off_and_the_shipped_default(self):
+        self.assertIn(0.0, MIN_SL_DISTANCE_GRID)
+        self.assertIn(50.0, MIN_SL_DISTANCE_GRID)
+
+    def test_every_combination_is_unique(self):
+        grid = build_risk_grid()
+        self.assertEqual(len(grid), len(set(grid)))
+
+
+class TestRunRiskPoint(unittest.TestCase):
+    def test_returns_risk_params_and_full_trade_level_metrics(self):
+        df = _synthetic_ohlc()
+        point = RiskGridPoint(rr_ratio=2.0, min_sl_distance=0.0)
+
+        row = _run_risk_point(point, df)
+
+        self.assertEqual(row["rr_ratio"], 2.0)
+        self.assertEqual(row["min_sl_distance"], 0.0)
+        for key in ["total_trades", "win_rate_pct", "profit_factor", "roi_pct", "avg_r_multiple"]:
+            self.assertIn(key, row)
+        # Detector/confluence params are never in the row - they're held fixed at
+        # BEST_KNOWN_DETECTOR_POINT, not swept, so they have nothing to report per-row.
+        self.assertNotIn("min_confluence", row)
+
+    def test_holds_detector_params_fixed_at_best_known_detector_point(self):
+        """A tighter min_sl_distance can only reject trades (never invent new
+        ones) relative to a looser one, on the same fixed detector params and
+        data - proves min_sl_distance actually reaches calculate_size(), not just
+        that RiskManager accepts and ignores it."""
+        df = _synthetic_ohlc(n=90)
+        loose = _run_risk_point(RiskGridPoint(rr_ratio=1.5, min_sl_distance=0.0), df)
+        strict = _run_risk_point(RiskGridPoint(rr_ratio=1.5, min_sl_distance=1_000_000.0), df)
+        self.assertLessEqual(strict["total_trades"], loose["total_trades"])
+        self.assertEqual(strict["total_trades"], 0)  # no real stop distance clears a $1M floor
+
+
+class TestRiskGridSectionOrderingIsPreservedBothWays(unittest.TestCase):
+    """Mirrors TestDiagnosticShortSectionOrderingIsPreservedBothWays - the risk
+    grid is a fourth section that can be (re)written in any order relative to the
+    other three, and must never eat a section it isn't responsible for."""
+
+    def test_risk_grid_written_after_holdout_is_inserted_before_it_not_after(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log([_sample_row()], "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+            write_risk_grid_section([_sample_risk_row()], "2025-04-01", "2025-12-31", path=path)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("Grid search results", content)
+        self.assertIn("Risk-parameter grid", content)
+        self.assertIn("Holdout evaluations", content)
+        self.assertLess(content.index("Grid search results"), content.index("Risk-parameter grid"))
+        self.assertLess(content.index("Risk-parameter grid"), content.index("Holdout evaluations"))
+
+    def test_risk_grid_written_after_diagnostic_lands_between_diagnostic_and_holdout(self):
+        long_only = [_sample_row(min_confluence=3)]
+        long_short = [_sample_row(min_confluence=3, roi_pct=-2.0, short_trades=4, total_trades=16)]
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log(long_only, "2025-04-01", "2025-12-31", path=path)
+            write_diagnostic_short_section(long_only, long_short, "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+            write_risk_grid_section([_sample_risk_row()], "2025-04-01", "2025-12-31", path=path)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertLess(content.index("Diagnostic: long+short"), content.index("Risk-parameter grid"))
+        self.assertLess(content.index("Risk-parameter grid"), content.index("Holdout evaluations"))
+
+    def test_rerunning_risk_grid_replaces_the_old_one_without_duplicating(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log([_sample_row()], "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+            write_risk_grid_section([_sample_risk_row(roi_pct=-2.0)], "2025-04-01", "2025-12-31", path=path)
+            write_risk_grid_section([_sample_risk_row(roi_pct=-9.0)], "2025-04-01", "2025-12-31", path=path)
+            content = path.read_text(encoding="utf-8")
+
+        self.assertEqual(content.count("Risk-parameter grid"), 1)
+        self.assertIn("-9.00", content)
+        self.assertIn("Holdout evaluations", content)
+
+    def test_rerunning_the_grid_search_preserves_the_risk_grid_section(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tuning-log.md"
+            write_tuning_log([_sample_row()], "2025-04-01", "2025-12-31", path=path)
+            write_risk_grid_section([_sample_risk_row()], "2025-04-01", "2025-12-31", path=path)
+            append_holdout_result(_sample_row(), "2026-01-01", "2026-03-31", path=path)
+
+            write_tuning_log([_sample_row()], "2025-04-01", "2025-12-31", path=path)  # re-run the search
+            content = path.read_text(encoding="utf-8")
+
+        self.assertIn("Grid search results", content)
+        self.assertIn("Risk-parameter grid", content)
         self.assertIn("Holdout evaluations", content)
 
 

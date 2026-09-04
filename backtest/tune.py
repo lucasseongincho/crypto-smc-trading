@@ -384,6 +384,136 @@ def evaluate_holdout(
     return _run_point(point, df)
 
 
+# ---- Targeted follow-up: risk-parameter grid (rr_ratio x min_sl_distance) --------
+# Deliberately separate from the 6-parameter detector grid above, not folded into a
+# combined sweep: this checks the one major *risk-management* lever that has never
+# been touched (backtest/risk.py's own module docstring flags both rr_ratio and
+# min_sl_distance as unvalidated ports - "don't assume it's automatically good" -
+# and puts them on the same re-validation checklist). Detector/confluence
+# parameters are held fixed at the best statistically-meaningful (non-low-sample)
+# combination the 1215-point grid found, rather than swept jointly with risk
+# parameters - that would multiply an already-expensive grid by a further 16x to
+# answer a question that's orthogonal to detector tuning.
+
+# ROI -3.54%, 26 trades - the best non-low-sample (>=20 trades) result out of 1215
+# detector/confluence combinations tuned on 2025-04-01 -> 2025-12-31. Not a
+# genuinely profitable combination - see docs/tuning-log.md's "Grid search results"
+# section, where zero of the 1215 combinations were profitable - just the best
+# available baseline to hold constant while checking whether risk-parameter tuning
+# is the missing lever.
+BEST_KNOWN_DETECTOR_POINT = GridPoint(
+    min_confluence=5,
+    min_ob_body_ratio=0.0,
+    min_fvg_gap_ratio=0.0,
+    min_trendline_break_distance=100.0,
+    min_channel_break_distance=200.0,
+    max_trap_retest_distance=float("inf"),
+)
+
+RR_RATIO_GRID = [1.0, 1.5, 2.0, 3.0]
+# take_profit_price() (backtest/risk.py) sets the TP at rr_ratio times the realized
+# SL distance from entry. 1.0 = symmetric risk/reward, breakeven at a 50% win rate.
+# 1.5 is the current shipped default - a straight port from the original crypto
+# bot's risk.py, explicitly flagged in this codebase's risk.py docstring as
+# unvalidated, kept here as the as-shipped reference point being audited, not a
+# favored guess. 2.0 and 3.0 are the classic asymmetric R:R targets common in
+# ICT/SMC-style trading (breakeven win rates 33%/25% respectively) - worth testing
+# given BEST_KNOWN_DETECTOR_POINT's underlying combination runs a 61.5% win rate at
+# rr_ratio's current default, comfortably above even the 3.0 breakeven bar if
+# realized R holds anywhere close to intended.
+
+MIN_SL_DISTANCE_GRID = [0.0, 50.0, 85.0, 170.0]
+# calculate_size() (backtest/risk.py) rejects a trade outright (size 0) if the
+# stop distance is tighter than this floor. risk.py's own docstring flags the
+# shipped default ($50) as tuned for a stock-scale port, never re-validated for
+# BTC's current price range, on the same checklist as rr_ratio above. Values:
+# 0.0 = off (no floor - baseline "no change from the filter's absence", same role
+# 0.0 plays for every other minimum-distance filter in this module). 50.0 = the
+# current shipped default, kept as the literal value being audited, not dropped.
+# 85.0 and 170.0 are ~1x/2x the same _TUNING_PERIOD_MEDIAN_ATR ($84.96) anchor used
+# for every other distance-based filter in this module - same reasoning: a stop
+# distance narrower than roughly a typical bar's worth of movement is more likely
+# noise than a real structural level.
+
+
+@dataclass(frozen=True)
+class RiskGridPoint:
+    rr_ratio: float
+    min_sl_distance: float
+
+
+def _run_risk_point(
+    point: RiskGridPoint, df: pd.DataFrame, detector_point: GridPoint = BEST_KNOWN_DETECTOR_POINT,
+) -> dict[str, Any]:
+    """Runs one (rr_ratio, min_sl_distance) combination against df, with every
+    detector/confluence parameter held fixed at detector_point. Row shape mirrors
+    _run_point()'s (plus the two risk fields) so the same reporting helpers apply."""
+    aggregator = SMCSignalAggregator(min_confluence=detector_point.min_confluence)
+    risk = RiskManager(
+        initial_balance=INITIAL_BALANCE, skip_if_capital_capped=True,
+        rr_ratio=point.rr_ratio, min_sl_distance=point.min_sl_distance,
+    )
+    result = run_backtest(
+        df, aggregator, risk, FillConfig(),
+        min_ob_body_ratio=detector_point.min_ob_body_ratio,
+        min_fvg_gap_ratio=detector_point.min_fvg_gap_ratio,
+        min_trendline_break_distance=detector_point.min_trendline_break_distance,
+        min_channel_break_distance=detector_point.min_channel_break_distance,
+        max_trap_retest_distance=detector_point.max_trap_retest_distance,
+    )
+    return {
+        "rr_ratio": point.rr_ratio,
+        "min_sl_distance": point.min_sl_distance,
+        **result.metrics(),
+    }
+
+
+def _init_risk_worker(snapshot_path: Path, start: str, end: str) -> None:
+    global _worker_df
+    full = load_snapshot(snapshot_path)
+    _worker_df = full.loc[start:end]
+
+
+def _run_risk_point_in_worker(point: RiskGridPoint) -> dict[str, Any]:
+    return _run_risk_point(point, _worker_df)
+
+
+def build_risk_grid() -> list[RiskGridPoint]:
+    return [RiskGridPoint(rr, sl) for rr, sl in itertools.product(RR_RATIO_GRID, MIN_SL_DISTANCE_GRID)]
+
+
+def run_risk_search(
+    snapshot_path: Path = DEFAULT_SNAPSHOT,
+    start: str = TUNING_START,
+    end: str = TUNING_END,
+    max_workers: int | None = None,
+) -> list[dict[str, Any]]:
+    """Runs the small (rr_ratio x min_sl_distance) grid against [start, end) of
+    snapshot_path, detector/confluence parameters fixed at BEST_KNOWN_DETECTOR_POINT.
+    Returns every combination's result row - the full plateau, not a top-N cut."""
+    grid = build_risk_grid()
+    print(
+        f"Running {len(grid)} risk grid points over {start} -> {end} "
+        f"(detector params fixed at {BEST_KNOWN_DETECTOR_POINT}) ..."
+    )
+    results: list[dict[str, Any]] = []
+    t0 = time.time()
+    with ProcessPoolExecutor(
+        max_workers=max_workers, initializer=_init_risk_worker, initargs=(snapshot_path, start, end),
+    ) as pool:
+        futures = [pool.submit(_run_risk_point_in_worker, point) for point in grid]
+        for i, future in enumerate(as_completed(futures), start=1):
+            row = future.result()
+            results.append(row)
+            elapsed = time.time() - t0
+            print(
+                f"[{i:>2}/{len(grid)}] {elapsed:6.1f}s  rr={row['rr_ratio']} sl={row['min_sl_distance']:<6} "
+                f"-> trades={row['total_trades']:>4} roi={row['roi_pct']:>7.2f}% pf={row['profit_factor']:.2f}"
+            )
+    print(f"Done in {time.time() - t0:.1f}s.")
+    return results
+
+
 # ---- Reporting --------------------------------------------------------------------
 
 _METRIC_COLUMNS = [
@@ -471,29 +601,32 @@ def _grid_search_section(results: list[dict[str, Any]], start: str, end: str) ->
 
 # The log file is always written in this section order: grid search results,
 # then (if it's ever been run) the long+short diagnostic, then (if it's ever been
-# run) holdout evaluations. Every writer below preserves whichever of these
-# sections it isn't itself responsible for, found by these markers - never by
-# slicing a formatted row string (see the "Caught and fixed a real bug" note in
-# this project's git history for why that's specifically disallowed here).
+# run) the risk-parameter grid, then (if it's ever been run) holdout evaluations.
+# Every writer below preserves whichever of these sections it isn't itself
+# responsible for, found by these markers - never by slicing a formatted row
+# string (see the "Caught and fixed a real bug" note in this project's git
+# history for why that's specifically disallowed here).
 _DIAGNOSTIC_MARKER = "\n## Diagnostic: long+short"
+_RISK_GRID_MARKER = "\n## Risk-parameter grid"
 _HOLDOUT_MARKER = "\n## Holdout evaluations"
 
 
-def _find_earliest_marker(text: str, markers: list[str]) -> int:
-    """Position of whichever marker appears first in text, or len(text) if none do."""
-    positions = [p for p in (text.find(m) for m in markers) if p != -1]
+def _find_earliest_marker(text: str, markers: list[str], start: int = 0) -> int:
+    """Position of whichever marker appears first in text at or after start, or
+    len(text) if none do."""
+    positions = [p for p in (text.find(m, start) for m in markers) if p != -1]
     return min(positions) if positions else len(text)
 
 
 def write_tuning_log(results: list[dict[str, Any]], start: str, end: str, path: Path = TUNING_LOG_PATH) -> None:
-    """Writes the grid search section fresh, but preserves any existing diagnostic
-    and/or holdout sections already in the file (from prior --diagnostic-allow-short
-    or --evaluate-holdout runs, in either order) - re-running the search must not
-    erase either record."""
+    """Writes the grid search section fresh, but preserves any existing diagnostic,
+    risk-grid, and/or holdout sections already in the file (from prior
+    --diagnostic-allow-short, run_risk_search, or --evaluate-holdout runs, in any
+    combination) - re-running the search must not erase any of them."""
     preserved_tail = ""
     if path.exists():
         existing = path.read_text(encoding="utf-8")
-        cut = _find_earliest_marker(existing, [_DIAGNOSTIC_MARKER, _HOLDOUT_MARKER])
+        cut = _find_earliest_marker(existing, [_DIAGNOSTIC_MARKER, _RISK_GRID_MARKER, _HOLDOUT_MARKER])
         preserved_tail = existing[cut:]
 
     header = (
@@ -563,25 +696,118 @@ def write_diagnostic_short_section(
     path: Path = TUNING_LOG_PATH,
 ) -> None:
     """Writes/replaces the '## Diagnostic: long+short' section, preserving the
-    grid-search section before it and the holdout section after it (in either
-    presence/absence combination) - never called automatically, only from the
+    grid-search section before it and the risk-grid/holdout sections after it (in
+    any presence/absence combination) - never called automatically, only from the
     --diagnostic-allow-short CLI path."""
     existing = path.read_text(encoding="utf-8") if path.exists() else "# Parameter tuning log\n"
 
     diag_start = existing.find(_DIAGNOSTIC_MARKER)
     if diag_start != -1:
         # Replace a prior diagnostic run rather than duplicating it.
-        holdout_after_diag = existing.find(_HOLDOUT_MARKER, diag_start + 1)
+        after_diag = _find_earliest_marker(existing, [_RISK_GRID_MARKER, _HOLDOUT_MARKER], start=diag_start + 1)
         head = existing[:diag_start]
-        tail = existing[holdout_after_diag:] if holdout_after_diag != -1 else ""
+        tail = existing[after_diag:]
     else:
-        holdout_start = existing.find(_HOLDOUT_MARKER)
-        head = existing[:holdout_start] if holdout_start != -1 else existing
-        tail = existing[holdout_start:] if holdout_start != -1 else ""
+        insert_before = _find_earliest_marker(existing, [_RISK_GRID_MARKER, _HOLDOUT_MARKER])
+        head = existing[:insert_before]
+        tail = existing[insert_before:]
 
     section = _diagnostic_short_section_text(long_only, long_short, start, end)
     path.write_text(head.rstrip("\n") + "\n\n" + section + "\n\n" + tail.lstrip("\n"), encoding="utf-8")
     print(f"Wrote diagnostic long+short section to {path}")
+
+
+def _risk_grid_section_text(results: list[dict[str, Any]], start: str, end: str) -> str:
+    ranked = sorted(results, key=lambda r: r["roi_pct"], reverse=True)
+    low_sample = [r for r in results if r["total_trades"] < LOW_SAMPLE_TRADE_THRESHOLD]
+    p = BEST_KNOWN_DETECTOR_POINT
+    header_cells = " | ".join(label for _, label, _ in _METRIC_COLUMNS)
+    sep_cells = " | ".join("---" for _ in _METRIC_COLUMNS)
+
+    lines = [
+        "## Risk-parameter grid: rr_ratio x min_sl_distance (targeted follow-up)",
+        "",
+        f"Tuning period: **{start} -> {end}**. {len(results)} combinations "
+        f"({len(RR_RATIO_GRID)} rr_ratio x {len(MIN_SL_DISTANCE_GRID)} min_sl_distance values), sorted by "
+        "ROI (highest first) - full plateau, not a top-N cut. Kept deliberately separate from the "
+        "6-parameter detector grid above rather than swept jointly with it - this checks a different, "
+        "orthogonal lever (risk management, not signal quality).",
+        "",
+        "Every combination below holds detector/confluence parameters fixed at the best non-low-sample "
+        f"result from the detector grid: `min_confluence={p.min_confluence}`, "
+        f"`min_ob_body_ratio={p.min_ob_body_ratio}`, `min_fvg_gap_ratio={p.min_fvg_gap_ratio}`, "
+        f"`min_trendline_break_distance={p.min_trendline_break_distance}`, "
+        f"`min_channel_break_distance={p.min_channel_break_distance}`, "
+        f"`max_trap_retest_distance={p.max_trap_retest_distance}` (`skip_if_capital_capped=True`, same "
+        "fixed sizing behavior as the detector grid).",
+        "",
+        f"- Combinations with fewer than {LOW_SAMPLE_TRADE_THRESHOLD} trades are flagged `†` (low-sample).",
+        f"- {len(low_sample)}/{len(results)} combinations are low-sample.",
+        "",
+        f"| RR ratio | Min SL$ | {header_cells} | † |",
+        f"|---|---|{sep_cells}|---|",
+    ]
+    for row in ranked:
+        flag = "†" if row["total_trades"] < LOW_SAMPLE_TRADE_THRESHOLD else " "
+        lines.append(f"| {row['rr_ratio']:.1f} | {row['min_sl_distance']:.1f} | {_metric_cells(row)} | {flag} |")
+
+    # Computed, not hardcoded, so this stays accurate if the grid is ever re-run
+    # with different values/results - which lever actually moved ROI is a
+    # data-dependent finding, not a fixed claim about this codebase.
+    by_rr: dict[float, list[float]] = {}
+    for row in results:
+        by_rr.setdefault(row["rr_ratio"], []).append(row["roi_pct"])
+    rr_spread = max(statistics.mean(v) for v in by_rr.values()) - min(statistics.mean(v) for v in by_rr.values())
+    max_sl_spread_within_rr = max((max(v) - min(v)) for v in by_rr.values())
+    best_rr = max(by_rr, key=lambda k: statistics.mean(by_rr[k]))
+    worst_rr = min(by_rr, key=lambda k: statistics.mean(by_rr[k]))
+
+    lines.append("")
+    lines.append(
+        f"**Reading this table**: holding min_sl_distance fixed and varying rr_ratio moves ROI by "
+        f"{rr_spread:.2f} points (worst rr_ratio={worst_rr} -> best rr_ratio={best_rr}); holding rr_ratio "
+        f"fixed and varying min_sl_distance moves ROI by at most {max_sl_spread_within_rr:.2f} points "
+        f"within any single rr_ratio. "
+        + (
+            "min_sl_distance had zero measured effect here - every value tested (0 through the largest in "
+            "MIN_SL_DISTANCE_GRID) produced identical trades/ROI for a given rr_ratio, meaning every "
+            "realized stop distance in this combination already exceeds the largest floor tested. At "
+            "BTC's current price scale, `_structural_stop_loss` (backtest/runner.py) places stops via "
+            "order-block levels or a 1% price buffer - roughly $750-$1,260 across this period's $75k-$126k "
+            "range - so a floor in the tens-to-low-hundreds of dollars can't bind. A future round anchored "
+            "on that actual scale (percent-of-price or a much larger dollar floor) would be a fairer test "
+            "of this parameter than this grid's values; rr_ratio is unambiguously the lever that matters "
+            "at the values tested here."
+            if max_sl_spread_within_rr < 0.01
+            else "Both levers show a measurable effect here - see the table above for the actual shape."
+        )
+    )
+    return "\n".join(lines)
+
+
+def write_risk_grid_section(
+    results: list[dict[str, Any]], start: str, end: str, path: Path = TUNING_LOG_PATH,
+) -> None:
+    """Writes/replaces the '## Risk-parameter grid' section, preserving the grid-
+    search/diagnostic sections before it and the holdout section after it (in any
+    presence/absence combination) - never called automatically, only from
+    run_risk_search()'s CLI path."""
+    existing = path.read_text(encoding="utf-8") if path.exists() else "# Parameter tuning log\n"
+
+    risk_start = existing.find(_RISK_GRID_MARKER)
+    if risk_start != -1:
+        # Replace a prior risk-grid run rather than duplicating it.
+        after_risk = _find_earliest_marker(existing, [_HOLDOUT_MARKER], start=risk_start + 1)
+        head = existing[:risk_start]
+        tail = existing[after_risk:]
+    else:
+        insert_before = _find_earliest_marker(existing, [_HOLDOUT_MARKER])
+        head = existing[:insert_before]
+        tail = existing[insert_before:]
+
+    section = _risk_grid_section_text(results, start, end)
+    path.write_text(head.rstrip("\n") + "\n\n" + section + "\n\n" + tail.lstrip("\n"), encoding="utf-8")
+    print(f"Wrote risk-parameter grid section to {path}")
 
 
 def append_holdout_result(row: dict[str, Any], start: str, end: str, path: Path = TUNING_LOG_PATH) -> None:
@@ -635,6 +861,12 @@ def main() -> None:
              "positions; this never affects live/trader.py or paper trading. See "
              "run_diagnostic_long_short()'s docstring.",
     )
+    parser.add_argument(
+        "--risk-grid", action="store_true",
+        help="Run the small, separate rr_ratio x min_sl_distance grid (detector/confluence params held "
+             "fixed at BEST_KNOWN_DETECTOR_POINT) instead of the main detector grid, and write its own "
+             "section to docs/tuning-log.md. See run_risk_search()'s docstring.",
+    )
     parser.add_argument("--min-confluence", type=int)
     parser.add_argument("--min-ob-body-ratio", type=float)
     parser.add_argument("--min-fvg-gap-ratio", type=float)
@@ -678,6 +910,15 @@ def main() -> None:
         )
         long_only, long_short = run_diagnostic_long_short(snapshot_path=args.snapshot, max_workers=args.max_workers)
         write_diagnostic_short_section(long_only, long_short, TUNING_START, TUNING_END)
+        return
+
+    if args.risk_grid:
+        print(
+            "Running the risk-parameter grid (rr_ratio x min_sl_distance) - detector/confluence params "
+            "held fixed. See run_risk_search()'s docstring."
+        )
+        results = run_risk_search(snapshot_path=args.snapshot, max_workers=args.max_workers)
+        write_risk_grid_section(results, TUNING_START, TUNING_END)
         return
 
     results = run_search(snapshot_path=args.snapshot, max_workers=args.max_workers)
