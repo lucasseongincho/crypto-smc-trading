@@ -1458,3 +1458,16 @@ Every combination below holds detector/confluence parameters fixed at the best n
 
 **Reading this table**: holding min_sl_distance fixed and varying rr_ratio moves ROI by 14.09 points (worst rr_ratio=1.0 -> best rr_ratio=3.0); holding rr_ratio fixed and varying min_sl_distance moves ROI by at most 0.00 points within any single rr_ratio. min_sl_distance had zero measured effect here - every value tested (0 through the largest in MIN_SL_DISTANCE_GRID) produced identical trades/ROI for a given rr_ratio, meaning every realized stop distance in this combination already exceeds the largest floor tested. At BTC's current price scale, `_structural_stop_loss` (backtest/runner.py) places stops via order-block levels or a 1% price buffer - roughly $750-$1,260 across this period's $75k-$126k range - so a floor in the tens-to-low-hundreds of dollars can't bind. A future round anchored on that actual scale (percent-of-price or a much larger dollar floor) would be a fairer test of this parameter than this grid's values; rr_ratio is unambiguously the lever that matters at the values tested here.
 
+## Holdout evaluations
+
+One-time deliberate checks via `python -m backtest.tune --evaluate-holdout ...`, never run automatically. Held-out period: 2026-01-01 -> 2026-03-31.
+
+### 2026-09-04 02:25 UTC
+
+Params: `min_confluence=5`, `min_ob_body_ratio=0.0`, `min_fvg_gap_ratio=0.0`, `min_trendline_break_distance=100.0`, `min_channel_break_distance=200.0`, `max_trap_retest_distance=inf`, `rr_ratio=3.0`, `min_sl_distance=50.0`. Evaluated on 2026-01-01 -> 2026-03-31.
+
+| Trades | Win% | PF | PnL | ROI% | MaxDD% | AvgR | MedR | StdR |
+|--- | --- | --- | --- | --- | --- | --- | --- | ---|
+| 21 | 19.0 | 0.33 | -3443 | -17.21 | 19.14 | -0.88 | -1.63 | 1.60 |
+
+**Did not generalize.** In-sample (tuning period, this same combination): 24 trades, 50.0% win rate, PF 1.32, ROI +6.86%. Held-out: 21 trades, **19.0% win rate**, PF 0.33, ROI **-17.21%**. Win rate alone collapsed by 31 points - this isn't a marginal miss, the edge the risk grid found in-sample is not present in the held-out quarter. Per this project's own validation discipline, the held-out period is not to be re-tuned against in response to this result: this is reported as "found something real in-sample that didn't generalize," a legitimate and informative outcome in its own right, not a bug to fix or a reason to widen the search. Nothing in this repository (live trading, paper trading, or the shipped `rr_ratio` default) should be changed on the basis of the in-sample risk-grid result alone - it has now been checked, and it did not hold up.
