@@ -143,6 +143,39 @@ class TestRunPoint(unittest.TestCase):
         self.assertNotIn("min_break_distance", row)
         for key in ["total_trades", "win_rate_pct", "profit_factor", "roi_pct", "avg_r_multiple", "median_r_multiple"]:
             self.assertIn(key, row)
+        # Omitting rr_ratio/min_sl_distance must match RiskManager's own class
+        # defaults, not some other unrelated value.
+        self.assertEqual(row["rr_ratio"], 1.5)
+        self.assertEqual(row["min_sl_distance"], 50.0)
+
+    def test_rr_ratio_and_min_sl_distance_reach_riskmanager_construction(self):
+        """evaluate_holdout() needs to confirm a combination found by the separate
+        risk grid (rr_ratio/min_sl_distance), not just a detector combination under
+        RiskManager's unswept defaults - proves these params actually reach
+        RiskManager's constructor, not just get accepted and ignored by
+        _run_point(). Asserted via the constructor call itself (deterministic)
+        rather than a behavioral difference in synthetic-data trade outcomes
+        (which can't be relied on to produce any trades at all)."""
+        from unittest.mock import patch
+        from backtest.risk import RiskManager as RealRiskManager
+
+        df = _synthetic_ohlc()
+        point = GridPoint(1, 0.0, 0.0, 0.0, 0.0, float("inf"))
+
+        with patch("backtest.tune.RiskManager", wraps=RealRiskManager) as mock_risk:
+            _run_point(point, df, rr_ratio=10.0, min_sl_distance=999.0)
+
+        mock_risk.assert_called_once()
+        _, kwargs = mock_risk.call_args
+        self.assertEqual(kwargs["rr_ratio"], 10.0)
+        self.assertEqual(kwargs["min_sl_distance"], 999.0)
+
+    def test_extreme_min_sl_distance_rejects_every_trade(self):
+        df = _synthetic_ohlc(n=90)
+        point = GridPoint(1, 0.0, 0.0, 0.0, 0.0, float("inf"))
+        row = _run_point(point, df, min_sl_distance=1_000_000.0)
+        self.assertEqual(row["min_sl_distance"], 1_000_000.0)
+        self.assertEqual(row["total_trades"], 0)  # no real stop distance clears a $1M floor
 
     def test_stricter_confluence_never_produces_more_trades_than_looser_on_the_same_data(self):
         df = _synthetic_ohlc(n=90)

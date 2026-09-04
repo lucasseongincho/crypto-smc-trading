@@ -212,7 +212,10 @@ class GridPoint:
     max_trap_retest_distance: float
 
 
-def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) -> dict[str, Any]:
+def _run_point(
+    point: GridPoint, df: pd.DataFrame, allow_short: bool = False,
+    rr_ratio: float = 1.5, min_sl_distance: float = 50.0,
+) -> dict[str, Any]:
     """Runs one parameter combination's backtest against df and returns its
     params + full trade-level metrics as a single flat dict - the row shape both
     run_search() and evaluate_holdout() produce.
@@ -220,7 +223,14 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
     allow_short defaults to False (the only executable-on-Kraken-Spot mode) and
     must only ever be set True from run_diagnostic_long_short() below - see that
     function's docstring and backtest/runner.py's FillEngine.allow_short docstring
-    for why this is diagnostic-only, never a real trading mode."""
+    for why this is diagnostic-only, never a real trading mode.
+
+    rr_ratio/min_sl_distance default to RiskManager's own class defaults (1.5,
+    50.0) - the 6-parameter detector grid never passes these (it holds risk
+    params fixed at those defaults throughout), only evaluate_holdout() does,
+    so a holdout check can confirm a combination found by the separate risk
+    grid (see BEST_KNOWN_DETECTOR_POINT/run_risk_search() below) rather than
+    silently re-testing a different combination under the unswept defaults."""
     aggregator = SMCSignalAggregator(min_confluence=point.min_confluence)
     # skip_if_capital_capped=True is fixed here, not a swept grid parameter -
     # it's an established fix (backtest/risk.py, commit 2a396ab; re-verified
@@ -228,7 +238,10 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
     # smoke test), not an open question this grid is meant to explore. Sweeping
     # it would mean half the grid re-measures a known-worse (forced-sizing)
     # baseline instead of spending that compute on genuinely unknown parameters.
-    risk = RiskManager(initial_balance=INITIAL_BALANCE, skip_if_capital_capped=True)
+    risk = RiskManager(
+        initial_balance=INITIAL_BALANCE, skip_if_capital_capped=True,
+        rr_ratio=rr_ratio, min_sl_distance=min_sl_distance,
+    )
     result = run_backtest(
         df, aggregator, risk, FillConfig(),
         min_ob_body_ratio=point.min_ob_body_ratio,
@@ -245,6 +258,13 @@ def _run_point(point: GridPoint, df: pd.DataFrame, allow_short: bool = False) ->
         "min_trendline_break_distance": point.min_trendline_break_distance,
         "min_channel_break_distance": point.min_channel_break_distance,
         "max_trap_retest_distance": point.max_trap_retest_distance,
+        # Always the RiskManager defaults (1.5/50.0) for the 6-parameter grid's own
+        # callers (they never pass overrides); only evaluate_holdout() ever passes
+        # non-default values, to confirm a combination found by the separate risk
+        # grid. Included unconditionally so a holdout entry is self-describing
+        # regardless of which grid found the combination it's confirming.
+        "rr_ratio": rr_ratio,
+        "min_sl_distance": min_sl_distance,
         # Always computed (cheap, harmless when allow_short=False - short_trades
         # is just always 0 then) so the long+short diagnostic can report the split
         # without a separate code path.
@@ -364,6 +384,8 @@ def evaluate_holdout(
     min_trendline_break_distance: float,
     min_channel_break_distance: float,
     max_trap_retest_distance: float,
+    rr_ratio: float = 1.5,
+    min_sl_distance: float = 50.0,
     snapshot_path: Path = DEFAULT_SNAPSHOT,
     start: str = HOLDOUT_START,
     end: str = HOLDOUT_END,
@@ -375,13 +397,17 @@ def evaluate_holdout(
     action. Running this repeatedly against different combinations would quietly
     turn the "held-out" period into a second tuning set, defeating the entire point
     of keeping it separate.
+
+    rr_ratio/min_sl_distance default to RiskManager's own class defaults (1.5,
+    50.0) - pass overrides here to confirm a combination found by the separate
+    risk grid (run_risk_search()) rather than the 6-parameter detector grid.
     """
     df = load_snapshot(snapshot_path).loc[start:end]
     point = GridPoint(
         min_confluence, min_ob_body_ratio, min_fvg_gap_ratio,
         min_trendline_break_distance, min_channel_break_distance, max_trap_retest_distance,
     )
-    return _run_point(point, df)
+    return _run_point(point, df, rr_ratio=rr_ratio, min_sl_distance=min_sl_distance)
 
 
 # ---- Targeted follow-up: risk-parameter grid (rr_ratio x min_sl_distance) --------
@@ -833,7 +859,8 @@ def append_holdout_result(row: dict[str, Any], start: str, end: str, path: Path 
         f"`min_fvg_gap_ratio={row['min_fvg_gap_ratio']}`, "
         f"`min_trendline_break_distance={row['min_trendline_break_distance']}`, "
         f"`min_channel_break_distance={row['min_channel_break_distance']}`, "
-        f"`max_trap_retest_distance={row['max_trap_retest_distance']}`. "
+        f"`max_trap_retest_distance={row['max_trap_retest_distance']}`, "
+        f"`rr_ratio={row.get('rr_ratio', 1.5)}`, `min_sl_distance={row.get('min_sl_distance', 50.0)}`. "
         f"Evaluated on {start} -> {end}.\n\n"
         f"| {header_cells} |\n|{sep_cells}|\n"
         f"| {_metric_cells(row)} |\n"  # metric cells only - params already stated in the prose above
@@ -873,6 +900,15 @@ def main() -> None:
     parser.add_argument("--min-trendline-break-distance", type=float)
     parser.add_argument("--min-channel-break-distance", type=float)
     parser.add_argument("--max-trap-retest-distance", type=float, help="Accepts 'inf' for no filter.")
+    parser.add_argument(
+        "--rr-ratio", type=float, default=1.5,
+        help="--evaluate-holdout only. Default matches RiskManager's own class default (1.5) - override "
+             "to confirm a combination found by run_risk_search() rather than the detector grid.",
+    )
+    parser.add_argument(
+        "--min-sl-distance", type=float, default=50.0,
+        help="--evaluate-holdout only. Default matches RiskManager's own class default (50.0).",
+    )
     args = parser.parse_args()
 
     if args.evaluate_holdout:
@@ -895,6 +931,7 @@ def main() -> None:
         row = evaluate_holdout(
             args.min_confluence, args.min_ob_body_ratio, args.min_fvg_gap_ratio,
             args.min_trendline_break_distance, args.min_channel_break_distance, args.max_trap_retest_distance,
+            rr_ratio=args.rr_ratio, min_sl_distance=args.min_sl_distance,
             snapshot_path=args.snapshot,
         )
         for key, label, fmt in _METRIC_COLUMNS:
